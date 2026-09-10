@@ -1,0 +1,4 @@
+# Optional local/Colab dependencies for retraining only.
+# Streamlit Community Cloud does NOT need this file for app inference.
+-r requirements.txt
+torch==2.10.0

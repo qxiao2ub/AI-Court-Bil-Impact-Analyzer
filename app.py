@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import io
 import json
-import tempfile
 from dataclasses import asdict
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-import torch
 
 from src.modeling import (
     CASE_TYPE_MAP,
@@ -67,9 +65,8 @@ st.warning(
 @st.cache_resource(show_spinner="Loading trained ML and neural-network models...")
 def get_models():
     bundle = load_bundle(MODEL_PATH)
-    device = torch.device("cpu")
-    net = build_dnn_from_bundle(bundle, device=device)
-    return bundle, net
+    dnn_state = build_dnn_from_bundle(bundle)
+    return bundle, dnn_state
 
 
 def extract_text_from_upload(uploaded_file) -> str:
@@ -107,7 +104,7 @@ with st.sidebar:
     st.header("Project")
     st.markdown("**Author:** Claire Yuan")
     st.markdown("**Advisor:** Dr. Qingyang Xiao")
-    st.caption("Python • scikit-learn • PyTorch • OCR • calibration • constrained RL")
+    st.caption("Python • scikit-learn • PyTorch-trained DNN / NumPy inference • OCR • calibration • constrained RL")
     st.divider()
     st.subheader("Privacy first")
     st.caption(
@@ -191,8 +188,8 @@ with input_tab:
                 st.error("The extracted text is too short to analyze reliably.")
             else:
                 try:
-                    bundle, net = get_models()
-                    pred = predict_case(bundle, net, case)
+                    bundle, dnn_state = get_models()
+                    pred = predict_case(bundle, dnn_state, case)
                     report = make_impact_report(case, pred)
                     result_json = json.dumps({"source_name": source_name, "parsed_case": case, "prediction": asdict(pred)}, indent=2)
                     st.session_state["analysis_result"] = (case, pred, report, result_json)
@@ -246,7 +243,7 @@ with methodology_tab:
 1. **Document ingestion:** PDF/image/text input is converted to text, using OCR when needed.
 2. **Transparent feature parsing:** regular expressions and keyword rules extract bill amount, response window, violation type, speed-over-limit, and court-appearance indicators.
 3. **Classical ML:** TF-IDF text features, one-hot categorical features, and standardized numeric features feed Ridge and logistic-regression models.
-4. **Deep learning:** a PyTorch multi-task neural network jointly estimates insurance change, impact duration, license points, escalation probability, and overall impact class.
+4. **Deep learning:** a multi-task neural network trained offline with PyTorch jointly estimates insurance change, impact duration, license points, escalation probability, and overall impact class. For cloud deployment, its learned weights are exported to NumPy so the app does not download PyTorch at startup.
 5. **Ensemble:** classical and neural predictions are averaged for the three regression outputs and probability outputs.
 6. **Calibration:** held-out calibration residuals form approximate 90% empirical prediction ranges.
 7. **Constrained reinforcement learning:** RL only chooses a report-presentation style (concise, detailed, or action-first). It does **not** change legal consequences or official decisions.
@@ -272,7 +269,7 @@ with about_tab:
     st.markdown(
         """
 ### Streamlit Community Cloud
-Deploy this repository with **`app.py`** as the entrypoint. The repository includes `requirements.txt` for Python packages and `packages.txt` for Linux OCR dependencies.
+Deploy this repository with **`app.py`** as the entrypoint. The cloud runtime is compatible with Python 3.14 and intentionally avoids a PyTorch download; `requirements.txt` contains only inference dependencies and `packages.txt` contains Linux OCR dependencies.
 
 ### Responsible-use boundary
 This application is an educational model demonstration. It must not be used to make sentencing, guilt, eligibility, creditworthiness, or other high-impact determinations about a person. Official consequences must be verified from the appropriate court, motor-vehicle agency, insurer, or qualified professional.

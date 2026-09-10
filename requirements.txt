@@ -1,13 +1,12 @@
---extra-index-url https://download.pytorch.org/whl/cpu
+# Streamlit Community Cloud runtime dependencies.
+# Deliberately excludes PyTorch: the trained DNN is exported to NumPy weights
+# for lightweight inference on Python 3.14.
 streamlit==1.63.0
+pandas==3.0.5
 numpy==2.3.5
-pandas==2.2.3
-scipy==1.17.0
 scikit-learn==1.8.0
-torch==2.10.0+cpu
 joblib==1.5.3
 pypdf==5.9.0
 Pillow==12.3.0
 pytesseract>=0.3.13,<0.4
 pdf2image>=1.17.0,<2
-matplotlib>=3.10,<4

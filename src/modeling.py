@@ -10,9 +10,6 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
-import scipy.sparse as sp
-import torch
-import torch.nn as nn
 
 SEED = 42
 INPUT_COLUMNS = [
@@ -44,28 +41,6 @@ Payment or response is due within 30 days.
 Court appearance is not required unless the citation is contested.
 """.strip()
 
-
-class MultiTaskImpactNet(nn.Module):
-    def __init__(self, input_dim: int):
-        super().__init__()
-        self.shared = nn.Sequential(
-            nn.Linear(input_dim, 192),
-            nn.ReLU(),
-            nn.BatchNorm1d(192),
-            nn.Dropout(0.25),
-            nn.Linear(192, 96),
-            nn.ReLU(),
-            nn.Dropout(0.20),
-            nn.Linear(96, 48),
-            nn.ReLU(),
-        )
-        self.reg_head = nn.Linear(48, 3)
-        self.escalation_head = nn.Linear(48, 1)
-        self.risk_head = nn.Linear(48, 3)
-
-    def forward(self, x):
-        h = self.shared(x)
-        return self.reg_head(h), self.escalation_head(h), self.risk_head(h)
 
 
 @dataclass
@@ -165,36 +140,85 @@ def parse_bill_text(text: str, defaults: dict[str, Any] | None = None) -> dict[s
 
 
 def to_dense_float32(x):
-    return x.toarray().astype(np.float32) if sp.issparse(x) else np.asarray(x, dtype=np.float32)
+    """Convert scikit-learn sparse/dense output to a NumPy float32 array."""
+    return x.toarray().astype(np.float32) if hasattr(x, "toarray") else np.asarray(x, dtype=np.float32)
 
 
 def load_bundle(path: str | Path) -> dict[str, Any]:
+    """Load the cloud-ready model bundle (no PyTorch runtime required)."""
     return joblib.load(path)
 
 
-def build_dnn_from_bundle(bundle: dict[str, Any], device: torch.device | None = None) -> MultiTaskImpactNet:
-    device = device or torch.device("cpu")
-    net = MultiTaskImpactNet(int(bundle["dnn_input_dim"])).to(device)
-    net.load_state_dict(bundle["dnn_state_dict"])
-    net.eval()
-    return net
+def build_dnn_from_bundle(bundle: dict[str, Any]) -> dict[str, np.ndarray]:
+    """Return the exported neural-network weights stored as NumPy arrays.
+
+    The network was trained with PyTorch offline, then its inference weights were
+    exported to NumPy so Streamlit Community Cloud does not need to download the
+    very large PyTorch runtime package during deployment.
+    """
+    state = bundle.get("dnn_numpy_state")
+    if not isinstance(state, dict):
+        raise RuntimeError(
+            "This model bundle is not the lightweight cloud artifact. "
+            "Re-run scripts/train_models.py or use the FIXED repository bundle."
+        )
+    return state
 
 
-def dnn_predict(bundle: dict[str, Any], net: MultiTaskImpactNet, case_df: pd.DataFrame, device=None):
-    device = device or torch.device("cpu")
+def _relu(x: np.ndarray) -> np.ndarray:
+    return np.maximum(x, 0.0)
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, -60.0, 60.0)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _softmax(x: np.ndarray) -> np.ndarray:
+    z = x - np.max(x, axis=1, keepdims=True)
+    exp_z = np.exp(z)
+    return exp_z / np.sum(exp_z, axis=1, keepdims=True)
+
+
+def dnn_predict(bundle: dict[str, Any], state: dict[str, np.ndarray], case_df: pd.DataFrame):
+    """Run the trained multi-task DNN with NumPy-only inference.
+
+    This reproduces the original PyTorch evaluation graph:
+    Linear -> ReLU -> BatchNorm -> Linear -> ReLU -> Linear -> ReLU -> heads.
+    Dropout layers are inactive during evaluation and therefore do not appear
+    in this inference implementation.
+    """
     x = to_dense_float32(bundle["dnn_preprocessor"].transform(case_df[INPUT_COLUMNS]))
-    net.eval()
-    with torch.no_grad():
-        xb = torch.tensor(x, dtype=torch.float32, device=device)
-        preg, pesc, prisk = net(xb)
-        reg_scaled = preg.cpu().numpy()
-        reg = reg_scaled * np.asarray(bundle["reg_std"]) + np.asarray(bundle["reg_mean"])
-        esc_prob = torch.sigmoid(pesc).cpu().numpy().ravel()
-        risk_prob = torch.softmax(prisk, dim=1).cpu().numpy()
+
+    h = x @ state["shared.0.weight"].T + state["shared.0.bias"]
+    h = _relu(h)
+
+    # BatchNorm1d evaluation mode, using the running statistics learned in training.
+    h = (h - state["shared.2.running_mean"]) / np.sqrt(state["shared.2.running_var"] + 1e-5)
+    h = h * state["shared.2.weight"] + state["shared.2.bias"]
+
+    h = h @ state["shared.4.weight"].T + state["shared.4.bias"]
+    h = _relu(h)
+    h = h @ state["shared.7.weight"].T + state["shared.7.bias"]
+    h = _relu(h)
+
+    reg_scaled = h @ state["reg_head.weight"].T + state["reg_head.bias"]
+    esc_logits = h @ state["escalation_head.weight"].T + state["escalation_head.bias"]
+    risk_logits = h @ state["risk_head.weight"].T + state["risk_head.bias"]
+
+    reg = reg_scaled * np.asarray(bundle["reg_std"], dtype=np.float32) + np.asarray(
+        bundle["reg_mean"], dtype=np.float32
+    )
+    esc_prob = _sigmoid(esc_logits).ravel()
+    risk_prob = _softmax(risk_logits)
     return reg, esc_prob, risk_prob
 
 
-def predict_case(bundle: dict[str, Any], net: MultiTaskImpactNet, case: dict[str, Any]) -> ImpactPrediction:
+def predict_case(
+    bundle: dict[str, Any],
+    state: dict[str, np.ndarray],
+    case: dict[str, Any],
+) -> ImpactPrediction:
     case_df = pd.DataFrame([case])
     models = bundle["classical_models"]
 
@@ -205,7 +229,7 @@ def predict_case(bundle: dict[str, Any], net: MultiTaskImpactNet, case: dict[str
     ml_risk_prob = models["risk"].predict_proba(case_df[INPUT_COLUMNS])[0]
     ml_risk_classes = list(models["risk"].named_steps["model"].classes_)
 
-    dnn_reg, dnn_esc, dnn_risk_prob = dnn_predict(bundle, net, case_df)
+    dnn_reg, dnn_esc, dnn_risk_prob = dnn_predict(bundle, state, case_df)
 
     ins_mid = max(0.0, 0.5 * ml_ins + 0.5 * float(dnn_reg[0, 0]))
     dur_mid = max(0.0, 0.5 * ml_dur + 0.5 * float(dnn_reg[0, 1]))

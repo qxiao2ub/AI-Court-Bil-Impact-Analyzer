@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from src.modeling import INPUT_COLUMNS, REG_TARGETS, RISK_TO_ID, MultiTaskImpactNet
+from src.modeling import INPUT_COLUMNS, REG_TARGETS, RISK_TO_ID
 
 SEED = 42
 N_SAMPLES = 2400
@@ -32,6 +32,40 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.set_num_threads(max(1, min(4, torch.get_num_threads())))
 DEVICE = torch.device("cpu")
+
+
+class MultiTaskImpactNet(nn.Module):
+    """Training-time PyTorch model. Cloud inference uses exported NumPy weights."""
+
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.shared = nn.Sequential(
+            nn.Linear(input_dim, 192),
+            nn.ReLU(),
+            nn.BatchNorm1d(192),
+            nn.Dropout(0.25),
+            nn.Linear(192, 96),
+            nn.ReLU(),
+            nn.Dropout(0.20),
+            nn.Linear(96, 48),
+            nn.ReLU(),
+        )
+        self.reg_head = nn.Linear(48, 3)
+        self.escalation_head = nn.Linear(48, 1)
+        self.risk_head = nn.Linear(48, 3)
+
+    def forward(self, x):
+        h = self.shared(x)
+        return self.reg_head(h), self.escalation_head(h), self.risk_head(h)
+
+
+def export_numpy_state(net: MultiTaskImpactNet):
+    """Serialize only inference tensors as NumPy arrays to avoid a PyTorch runtime dependency."""
+    return {
+        key: value.detach().cpu().numpy().copy()
+        for key, value in net.state_dict().items()
+        if not key.endswith("num_batches_tracked")
+    }
 
 
 def sigmoid(x):
@@ -225,7 +259,7 @@ def main():
     artifact = {
         "classical_models": models,
         "dnn_preprocessor": dnn_preprocessor,
-        "dnn_state_dict": {k: v.detach().cpu() for k, v in net.state_dict().items()},
+        "dnn_numpy_state": export_numpy_state(net),
         "dnn_input_dim": X_train.shape[1],
         "reg_mean": reg_mean,
         "reg_std": reg_std,
@@ -241,7 +275,9 @@ def main():
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "python": platform.python_version(),
             "scikit_learn": sklearn.__version__,
-            "torch": torch.__version__,
+            "training_framework": f"PyTorch {torch.__version__} (offline training)",
+            "deployment_inference": "NumPy (no PyTorch runtime dependency)",
+            "streamlit_cloud_target": "Python 3.14 compatible",
         },
     }
     out = ROOT / "models" / "claire_yuan_court_bill_impact_models.joblib"
