@@ -22,9 +22,17 @@ The earlier repository could spend a very long time in the dependency-install st
 - Large/unneeded cloud dependencies such as Matplotlib and an explicit SciPy pin were removed.
 - `requirements-training.txt` is separated from `requirements.txt`, so optional model retraining does not burden normal app deployment.
 
+
+## Migrated UI design
+
+This revision translates the attached TanStack/React editorial UI into native Streamlit styling while preserving the Court-Bill AI pipeline. The migrated interface uses the source design's warm paper background, fine borders, JetBrains Mono interface typography, Instrument Serif display typography, orange accent, ticker treatment, oversized editorial hero, compact uppercase labels, rule-based result cards, principles block, and responsive behavior.
+
+The unrelated AP News, legislation lookup, Supabase, Cloudflare, watchlist, and server-side React features from the source UI are intentionally excluded. They are not needed for Claire Yuan's court-notice prototype and would make Streamlit Community Cloud deployment heavier. See [`UI_MIGRATION.md`](UI_MIGRATION.md) for details.
+
 ## Features
 
 - Streamlit Community Cloud-ready `app.py` entrypoint
+- Attached editorial UI design translated into native Streamlit + CSS
 - Python 3.14-compatible deployment dependencies
 - PDF text extraction with OCR fallback
 - Image OCR through Tesseract
@@ -48,11 +56,14 @@ The earlier repository could spend a very long time in the dependency-install st
 ├── LICENSE
 ├── README.md
 ├── DEPLOYMENT_FIX.md
+├── UI_MIGRATION.md
 ├── requirements.txt
 ├── requirements-training.txt
 ├── packages.txt
 ├── .streamlit/
 │   └── config.toml
+├── assets/
+│   └── ui-reference-favicon.ico
 ├── examples/
 │   └── demo_speeding_notice.txt
 ├── models/
@@ -62,7 +73,8 @@ The earlier repository could spend a very long time in the dependency-install st
 ├── scripts/
 │   └── train_models.py
 ├── tests/
-│   └── smoke_test.py
+│   ├── smoke_test.py
+│   └── ui_migration_test.py
 └── src/
     ├── __init__.py
     └── modeling.py
