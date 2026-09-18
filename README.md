@@ -1,4 +1,4 @@
-# AI Court-Bill Impact Analyzer
+# AI Court Bill Impact Analyzer
 
 **Author:** Claire Yuan  
 **Advisor:** Dr. Qingyang Xiao  
