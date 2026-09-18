@@ -57,6 +57,7 @@ The unrelated AP News, legislation lookup, Supabase, Cloudflare, watchlist, and 
 ├── README.md
 ├── DEPLOYMENT_FIX.md
 ├── UI_MIGRATION.md
+├── TOP_BANNER_FIX.md
 ├── requirements.txt
 ├── requirements-training.txt
 ├── packages.txt
@@ -186,3 +187,10 @@ Copyright (c) 2026 Claire Yuan. See [`LICENSE`](LICENSE).
 
 - **Author:** Claire Yuan
 - **Advisor:** Dr. Qingyang Xiao
+
+## v2.1 — top-banner visibility repair
+
+This package reserves a responsive safe area beneath Streamlit Community
+Cloud's fixed Share/Edit toolbar. The `court_impact` navigation banner and its
+full 72-pixel height now render below the toolbar instead of underneath it.
+See `TOP_BANNER_FIX.md` for the implementation details.

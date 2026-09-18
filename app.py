@@ -71,22 +71,41 @@ html, body, [data-testid="stAppViewContainer"], .stApp {
   background: var(--paper) !important;
 }
 
-[data-testid="stHeader"] {
-  background: rgba(250,248,243,.94) !important;
-  backdrop-filter: blur(10px);
-}
 
 #MainMenu { visibility: hidden; }
 footer { visibility: hidden; }
 [data-testid="stSidebar"] { display: none; }
 
-.block-container {
+/*
+ * Streamlit Community Cloud keeps its Share/Edit toolbar fixed above the app.
+ * Reserve a stable safe area so the custom navigation banner always starts
+ * below that toolbar instead of being covered by it.
+ */
+:root { --streamlit-toolbar-safe-area: 4.75rem; }
+
+.block-container,
+[data-testid="stAppViewBlockContainer"],
+[data-testid="stMainBlockContainer"] {
   max-width: 1160px !important;
-  padding-top: .35rem !important;
+  padding-top: var(--streamlit-toolbar-safe-area) !important;
   padding-bottom: 4rem !important;
   padding-left: 2rem !important;
   padding-right: 2rem !important;
+  overflow: visible !important;
 }
+
+/* Keep Streamlit's own toolbar readable while preventing it from visually
+   merging with the first app banner. */
+[data-testid="stHeader"] {
+  min-height: 3.75rem !important;
+  background: rgba(250,248,243,.97) !important;
+  border-bottom: 1px solid rgba(214,211,202,.72) !important;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+/* Anchor links should also stop below the fixed Streamlit toolbar. */
+html { scroll-padding-top: 5.25rem; }
 
 h1, h2, h3, h4, h5, h6 {
   color: var(--ink) !important;
@@ -96,6 +115,9 @@ h1, h2, h3, h4, h5, h6 {
 p, li, label, div { color: var(--ink); }
 
 .bb-nav {
+  position: relative;
+  z-index: 3;
+  overflow: visible;
   border-bottom: 1px solid var(--line);
   display: flex;
   align-items: center;
@@ -460,7 +482,13 @@ p, li, label, div { color: var(--ink); }
   .bb-hero { padding-top: 3.6rem; padding-bottom: 3.7rem; }
   .bb-step-grid, .bb-metric-grid, .bb-principle-grid { grid-template-columns: 1fr; }
   .bb-metric { padding-bottom: .4rem; }
-  .block-container { padding-left: 1.15rem !important; padding-right: 1.15rem !important; }
+  .block-container,
+  [data-testid="stAppViewBlockContainer"],
+  [data-testid="stMainBlockContainer"] {
+    padding-top: 4.5rem !important;
+    padding-left: 1.15rem !important;
+    padding-right: 1.15rem !important;
+  }
   .bb-nav, .bb-ticker, .bb-hero, .bb-principles, .bb-footer { margin-left:-1.15rem; margin-right:-1.15rem; }
   .bb-nav, .bb-hero, .bb-principles, .bb-footer { padding-left:1.15rem; padding-right:1.15rem; }
 }
@@ -575,7 +603,7 @@ st.markdown(
   <div class="bb-brand">
     <span class="bb-square"></span>
     <span>court_impact</span>
-    <span class="bb-version">/v2.0</span>
+    <span class="bb-version">/v2.1</span>
   </div>
   <div class="bb-nav-right">
     <span>AI research prototype</span>

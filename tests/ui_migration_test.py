@@ -17,6 +17,10 @@ def main():
     assert "#d07a2d" in app.lower()
     assert "bb-ticker" in app
     assert "bb-principles" in app
+    assert "--streamlit-toolbar-safe-area: 4.75rem" in app
+    assert '[data-testid="stMainBlockContainer"]' in app
+    assert "scroll-padding-top: 5.25rem" in app
+    assert '<span class="bb-version">/v2.1</span>' in app
     assert "torch" not in [line.strip().split("==")[0] for line in req.splitlines() if line.strip() and not line.startswith("#")]
     assert 'backgroundColor = "#FAF8F3"' in cfg
     assert 'primaryColor = "#D07A2D"' in cfg
