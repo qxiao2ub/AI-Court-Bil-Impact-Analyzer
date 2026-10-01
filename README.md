@@ -1,196 +1,169 @@
-# AI Court Bill Impact Analyzer
+# AI Legislative Bill Impact Analyzer
 
 **Author:** Claire Yuan  
 **Advisor:** Dr. Qingyang Xiao  
 **License:** MIT
 
-A Streamlit research prototype derived from Claire Yuan's Colab notebook. The app accepts a redacted court-issued notice, citation, fine, or bill; extracts model features; runs a classical machine-learning + neural-network ensemble; and produces a plain-language impact report with calibrated prediction ranges.
+A Streamlit Community Cloud-ready educational application that helps users navigate U.S. federal legislative bills without replacing the official source. It can retrieve a live bill from the official Congress.gov API, analyze a searchable PDF, or process pasted bill text.
 
-> **Important:** The bundled model is trained entirely on synthetic `Demo-*` records. It is an educational prototype, not legal advice and not a tool for guilt, sentencing, eligibility, creditworthiness, or other high-impact decisions.
+> This is a neutral educational research prototype. It does not provide legal advice, endorse or oppose legislation, determine constitutionality, or predict whether a bill will pass.
 
-## Streamlit Cloud deployment fix
+## Major capabilities
 
-This revision is specifically optimized for the current Streamlit Community Cloud Python 3.14 runtime.
+### Input and ingestion
 
-The earlier repository could spend a very long time in the dependency-install stage because it pinned an older pandas release and installed PyTorch during every cloud build. The fixed version changes the deployment architecture:
+- Search a live federal measure by citation, including `H.R.`, `S.`, `H.J.Res.`, `S.J.Res.`, `H.Con.Res.`, `S.Con.Res.`, `H.Res.`, and `S.Res.`
+- Browse recent measures by Congress and type
+- Pull official bill detail, actions, amendments, committees, cosponsors, related bills, subjects, summaries, text versions, and titles from Congress.gov
+- Download a selected official full-text version from Congress.gov, GovInfo, or GPO
+- Upload a searchable PDF or paste bill text manually
+- Auto-detect the procedural stage from official action evidence
 
-- **No PyTorch package is installed by Streamlit Cloud.**
-- The multi-task neural network is still **trained with PyTorch offline**, but its learned weights are exported as NumPy arrays.
-- The Streamlit app performs the neural-network forward pass with **NumPy-only inference**.
-- The model's classical scikit-learn pipelines are preserved.
-- pandas is updated to a Python-3.14-compatible wheel release.
-- Large/unneeded cloud dependencies such as Matplotlib and an explicit SciPy pin were removed.
-- `requirements-training.txt` is separated from `requirements.txt`, so optional model retraining does not burden normal app deployment.
+### Core analysis
 
-
-## Migrated UI design
-
-This revision translates the attached TanStack/React editorial UI into native Streamlit styling while preserving the Court-Bill AI pipeline. The migrated interface uses the source design's warm paper background, fine borders, JetBrains Mono interface typography, Instrument Serif display typography, orange accent, ticker treatment, oversized editorial hero, compact uppercase labels, rule-based result cards, principles block, and responsive behavior.
-
-The unrelated AP News, legislation lookup, Supabase, Cloudflare, watchlist, and server-side React features from the source UI are intentionally excluded. They are not needed for Claire Yuan's court-notice prototype and would make Streamlit Community Cloud deployment heavier. See [`UI_MIGRATION.md`](UI_MIGRATION.md) for details.
-
-## Features
-
-- Streamlit Community Cloud-ready `app.py` entrypoint
-- Attached editorial UI design translated into native Streamlit + CSS
-- Python 3.14-compatible deployment dependencies
-- PDF text extraction with OCR fallback
-- Image OCR through Tesseract
-- TXT, CSV, and Markdown ingestion
-- Transparent bill-feature parser
-- scikit-learn Ridge and logistic-regression pipelines
-- Multi-task deep neural network trained with PyTorch
-- Lightweight NumPy neural-network inference on Streamlit Cloud
-- Classical + DNN ensemble predictions
-- Approximate 90% empirical calibration ranges
-- Constrained reinforcement-learning demo for report presentation only
+- Plain-English extractive summary
+- Section-by-section summaries with original section text available for verification
+- Operative-language extraction for duties, permissions, amendments, appropriations, reports, and effective dates
+- “Stated purpose” versus “operative text” view
+- Low-to-medium-confidence scope-mismatch review flags for possible unrelated provisions
+- Legal and procedural glossary
+- Fiscal-language and dollar-reference detection
+- Congress.gov CBO cost-estimate metadata display when supplied by the API
+- Confidence and uncertainty reporting
 - Markdown and JSON report downloads
-- Privacy and responsible-use warnings
-- Original Colab notebook included under `notebooks/`
+
+### Personalized relevance
+
+- Optional profile fields: age, state, income bracket, occupation, industry, student, veteran, business owner, and caregiver
+- A “How this may affect you” checklist that identifies provisions and eligibility questions to verify
+- Prototype account login and saved profiles
+
+### Trust, tracking, and civic engagement
+
+- Official text, summary, and bill-page links remain visible
+- Official text-version comparison with a unified line diff
+- Sponsor, cosponsor, committee, related-bill, and vote-reference displays
+- Current-member lookup by state and optional House district
+- Official House and Senate contact-directory buttons
+- Neutral, editable constituent-message builder; the app never chooses a position or sends a message
+- Followed bills and in-app status-change notifications when the user manually checks for updates
+
+### Comparison and usage analytics
+
+- Side-by-side comparison of a current bill with another live or pasted bill
+- TF-IDF text similarity, shared topics, status, section counts, and fiscal-signal comparison
+- Unique visitor counter: one count per Streamlit browser session
+
+## Explainable AI approach
+
+The cloud app intentionally avoids a large GPU model so it starts reliably on Streamlit Community Cloud. The analysis pipeline uses:
+
+1. Section-header parsing and fallback document chunking
+2. Sentence tokenization
+3. TF-IDF sentence representations
+4. Centrality and position scoring for extractive summaries
+5. Transparent legalese substitutions
+6. Rule-based status, obligation, fiscal, date, and topic extraction
+7. Confidence based on source completeness and text coverage
+
+The app does not invent missing provisions. Its paraphrases should always be checked against the official text.
 
 ## Repository structure
 
 ```text
 .
 ├── app.py
+├── requirements.txt
+├── packages.txt
 ├── LICENSE
 ├── README.md
-├── DEPLOYMENT_FIX.md
-├── UI_MIGRATION.md
-├── TOP_BANNER_FIX.md
-├── requirements.txt
-├── requirements-training.txt
-├── packages.txt
-├── .streamlit/
-│   └── config.toml
-├── assets/
-│   └── ui-reference-favicon.ico
+├── DEPLOYMENT.md
+├── FEATURE_IMPLEMENTATION.md
+├── MIGRATION_NOTES.md
+├── RELEASE_NOTES.md
+├── VALIDATION.md
 ├── examples/
-│   └── demo_speeding_notice.txt
-├── models/
-│   └── claire_yuan_court_bill_impact_models.joblib
-├── notebooks/
-│   └── Claire_Yuan_AI_Court_Bill_Impact_Analyzer_Colab.ipynb
-├── scripts/
-│   └── train_models.py
+│   └── demo_bill.txt
+├── src/
+│   ├── bill_analysis.py
+│   ├── congress_client.py
+│   ├── persistence.py
+│   └── ui.py
 ├── tests/
 │   ├── smoke_test.py
-│   └── ui_migration_test.py
-└── src/
-    ├── __init__.py
-    └── modeling.py
+│   ├── streamlit_stub_smoke.py
+│   ├── test_core.py
+│   └── test_repository_static.py
+└── .streamlit/
+    ├── config.toml
+    └── secrets.toml.example
 ```
 
-## Deploy on Streamlit Community Cloud
-
-1. Replace the contents of the existing GitHub repository with the contents of this fixed package.
-2. Confirm these files are in the **repository root**:
-   - `app.py`
-   - `requirements.txt`
-   - `packages.txt`
-   - `LICENSE`
-3. Keep the entrypoint as:
-
-```text
-app.py
-```
-
-4. Python **3.14** can be used. This fixed build no longer requires switching back to Python 3.13.
-5. Commit and push the changes to GitHub.
-6. Streamlit Community Cloud should detect the changed dependencies and perform a clean rebuild.
-7. If the old build is still displayed, open the app management menu and reboot/redeploy the app so the new dependency file is installed.
-
-## Runtime dependencies
-
-Normal cloud deployment uses only `requirements.txt`:
-
-```text
-streamlit==1.63.0
-pandas==3.0.5
-numpy==2.3.5
-scikit-learn==1.8.0
-joblib==1.5.3
-pypdf==5.9.0
-Pillow==12.3.0
-pytesseract>=0.3.13,<0.4
-pdf2image>=1.17.0,<2
-```
-
-Linux OCR utilities are declared in `packages.txt`:
-
-```text
-tesseract-ocr
-poppler-utils
-```
-
-## Run locally
-
-Python 3.13 or Python 3.14 can be used for inference.
+## Local run
 
 ```bash
 python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-
-# macOS/Linux
-source .venv/bin/activate
-
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-For local OCR, also install Tesseract and Poppler using your operating system's package manager.
+Manual-paste, PDF, and fictional-demo modes work without an API key.
 
-## Smoke test without launching Streamlit
+## Congress.gov API setup
+
+1. Request a free key from the official Congress.gov API sign-up page.
+2. For local development, create `.streamlit/secrets.toml`:
+
+```toml
+CONGRESS_API_KEY = "your-key-here"
+```
+
+3. For Streamlit Community Cloud, add the same entry under **App settings → Secrets**.
+4. Do not commit the real secret.
+
+## Streamlit Community Cloud deployment
+
+1. Create a GitHub repository.
+2. Upload the **contents of this folder** to the repository root.
+3. In Streamlit Community Cloud, select the repository and branch.
+4. Set **Main file path** to `app.py`.
+5. Select **Python 3.14** in Advanced settings.
+6. Add `CONGRESS_API_KEY` under Secrets.
+7. Deploy or reboot the app.
+
+The repository pins Streamlit 1.64.0 and Python-3.14-compatible scientific-package releases. The top layout reserves a safe area below Streamlit Community Cloud’s fixed Share/Edit toolbar, preventing the custom navigation banner from being hidden.
+
+The Congress.gov client retries transient API failures and paginates collection endpoints so actions, amendments, cosponsors, titles, summaries, and text-version lists are not silently limited to the API's first page.
+
+## Prototype account and notification limitations
+
+The classroom prototype stores accounts, profiles, follows, visitor sessions, and notifications in local SQLite. Passwords use salted PBKDF2-HMAC-SHA256 hashes. Streamlit Community Cloud’s local filesystem is not a production database and can reset during redeploys, restarts, or platform maintenance. Notifications are created only when a signed-in user manually checks followed bills; this repository does not run a background email or SMS service.
+
+A production version should use managed authentication, a persistent managed database, encryption, role-based access, audit logs, secret management, and a scheduled notification worker.
+
+## PDF limitation
+
+The lightweight cloud build extracts embedded text from searchable PDFs. Scanned image-only PDFs require OCR, which is deliberately not bundled because system OCR packages previously caused slow Streamlit builds. Users can paste OCR text manually.
+
+## Privacy
+
+Do not enter sensitive personal information. The visitor counter stores a random session hash and timestamps in the local prototype database; it does not intentionally store IP addresses. A production privacy notice should reflect the hosting platform, analytics, authentication provider, and data-retention policy actually used.
+
+## Validation
+
+Run the repository checks from the project root:
 
 ```bash
+python -m compileall -q app.py src tests
+python -m unittest discover -s tests -p "test_*.py" -v
 python tests/smoke_test.py
+python tests/streamlit_stub_smoke.py
 ```
 
-The test checks that the model artifact loads, the demo court notice parses, the classical models run, the NumPy DNN inference runs, and a complete impact report is produced.
+The stub smoke test executes the full Streamlit entrypoint against a minimal local test double. It catches import-time errors and widget/tab integration mistakes without requiring a browser. A final deployment should still be verified in Streamlit Community Cloud with a valid Congress.gov API key.
 
-## Retrain the model (optional)
+## License
 
-PyTorch is needed only when training a new model. Install the separate training dependency file:
-
-```bash
-pip install -r requirements-training.txt
-python scripts/train_models.py
-```
-
-The training script automatically exports the trained PyTorch network to NumPy arrays before saving the Streamlit model artifact. The resulting cloud app therefore remains PyTorch-free at inference time.
-
-## Model architecture
-
-The deployed ensemble combines:
-
-1. **TF-IDF + structured features** for document text and parsed case attributes.
-2. **Ridge regression** for continuous prototype estimates.
-3. **Logistic regression** for escalation and risk categories.
-4. **Multi-task neural network**, trained offline in PyTorch.
-5. **NumPy forward-pass inference**, reproducing the trained DNN's linear, ReLU, BatchNorm, and output-head operations without importing PyTorch.
-6. **Calibration ranges** from held-out synthetic records.
-7. **Constrained reinforcement learning**, used only to select report presentation style.
-
-## Responsible development notes
-
-For future real-data research, use only appropriately obtained, de-identified, documented data. Separate official court outcomes from downstream third-party outcomes such as insurance changes. Evaluate by jurisdiction and time period, document missingness and selection effects, test calibration and subgroup error patterns, and require human review. Do not train on unnecessary protected or identifying attributes.
-
-The prototype must not be used to make sentencing, guilt, eligibility, creditworthiness, or other high-impact determinations about a person. Official consequences must be verified from the appropriate court, motor-vehicle agency, insurer, or qualified professional.
-
-## MIT License
-
-Copyright (c) 2026 Claire Yuan. See [`LICENSE`](LICENSE).
-
-## Credits
-
-- **Author:** Claire Yuan
-- **Advisor:** Dr. Qingyang Xiao
-
-## v2.1 — top-banner visibility repair
-
-This package reserves a responsive safe area beneath Streamlit Community
-Cloud's fixed Share/Edit toolbar. The `court_impact` navigation banner and its
-full 72-pixel height now render below the toolbar instead of underneath it.
-See `TOP_BANNER_FIX.md` for the implementation details.
+Released under the [MIT License](LICENSE). Copyright © 2026 Claire Yuan.

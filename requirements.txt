@@ -1,12 +1,7 @@
-# Streamlit Community Cloud runtime dependencies.
-# Deliberately excludes PyTorch: the trained DNN is exported to NumPy weights
-# for lightweight inference on Python 3.14.
-streamlit==1.63.0
-pandas==3.0.5
-numpy==2.3.5
-scikit-learn==1.8.0
-joblib==1.5.3
-pypdf==5.9.0
-Pillow==12.3.0
-pytesseract>=0.3.13,<0.4
-pdf2image>=1.17.0,<2
+streamlit==1.64.0
+pandas==3.0.6
+numpy==2.5.3
+scikit-learn==1.9.1
+requests==2.34.2
+beautifulsoup4==4.15.0
+pypdf==6.19.0

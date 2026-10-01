@@ -3,994 +3,1347 @@ from __future__ import annotations
 import html
 import io
 import json
+import os
+import re
+import uuid
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any, Mapping
 
 import pandas as pd
 import streamlit as st
+from pypdf import PdfReader
 
-from src.modeling import (
-    CASE_TYPE_MAP,
-    DEMO_BILL_TEXT,
-    DEMO_JURISDICTIONS,
-    VIOLATION_CODES,
-    build_dnn_from_bundle,
-    load_bundle,
-    make_impact_report,
-    parse_bill_text,
-    predict_case,
+from src.bill_analysis import (
+    BillAnalysis,
+    analysis_to_json,
+    analysis_to_markdown,
+    analyze_bill,
+    build_contact_message,
+    compare_analyses,
+    extract_votes,
+    personalize_impact,
+    sponsor_rows,
+    version_diff,
 )
+from src.congress_client import (
+    BILL_TYPE_DISPLAY,
+    BillRef,
+    CongressAPIError,
+    CongressClient,
+    current_congress_fallback,
+    latest_text_version,
+    parse_bill_citation,
+    preferred_text_format,
+)
+from src.persistence import (
+    authenticate,
+    create_user,
+    follow_bill,
+    get_profile,
+    init_db,
+    list_follows,
+    list_notifications,
+    mark_notifications_read,
+    record_visit,
+    save_profile,
+    unfollow_bill,
+    update_follow_and_notify,
+    visitor_stats,
+)
+from src.ui import callout, footer, hero, inject_styles, metric_cards, section_intro, source_box, top_chrome
+
 
 ROOT = Path(__file__).resolve().parent
-MODEL_PATH = ROOT / "models" / "claire_yuan_court_bill_impact_models.joblib"
+DEMO_PATH = ROOT / "examples" / "demo_bill.txt"
+HOUSE_CONTACT_URL = "https://www.house.gov/representatives/find-your-representative"
+SENATE_CONTACT_URL = "https://www.senate.gov/senators/senators-contact.htm"
+API_SIGNUP_URL = "https://api.congress.gov/sign-up/"
 
 st.set_page_config(
-    page_title="AI Court-Bill Impact Analyzer",
-    page_icon="⚖️",
+    page_title="AI Legislative Bill Impact Analyzer",
+    page_icon="🏛️",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
+inject_styles()
+
+
 # -----------------------------------------------------------------------------
-# UI migration
+# Persistence and visitor counter
 # -----------------------------------------------------------------------------
-# The attached UI source is a TanStack/React design. Streamlit Community Cloud
-# launches Python entrypoints, so the visual system is translated here into
-# native Streamlit + CSS rather than requiring a second Node server/runtime.
-# Design cues preserved: warm paper background, JetBrains Mono body type,
-# Instrument Serif display type, fine rules, editorial spacing, orange accent,
-# ticker treatment, uppercase micro-labels, minimal square controls, and
-# report-page typography.
-# -----------------------------------------------------------------------------
-
-st.markdown(
-    """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');
-
-:root {
-  --paper: #faf8f3;
-  --ink: #1a1a1a;
-  --muted: #7a766c;
-  --line: #d6d3ca;
-  --soft: #f3efe4;
-  --accent: #d07a2d;
-  --green: #3a7a4a;
-  --red: #a04438;
-}
-
-html, body, [data-testid="stAppViewContainer"], .stApp {
-  background: var(--paper) !important;
-  color: var(--ink) !important;
-  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
-  font-feature-settings: "ss01", "cv02";
-}
-
-[data-testid="stAppViewContainer"] > .main,
-[data-testid="stMain"] {
-  background: var(--paper) !important;
-}
+try:
+    init_db()
+    if "visit_session_id" not in st.session_state:
+        st.session_state["visit_session_id"] = str(uuid.uuid4())
+        st.session_state["visitor_count"] = record_visit(st.session_state["visit_session_id"])
+    stats = visitor_stats()
+    visitor_count = int(stats.get("unique_sessions", st.session_state.get("visitor_count", 0)))
+except Exception as exc:  # The app remains usable if Streamlit's ephemeral disk is unavailable.
+    visitor_count = 0
+    st.session_state["persistence_error"] = str(exc)
 
 
-#MainMenu { visibility: hidden; }
-footer { visibility: hidden; }
-[data-testid="stSidebar"] { display: none; }
-
-/*
- * Streamlit Community Cloud keeps its Share/Edit toolbar fixed above the app.
- * Reserve a stable safe area so the custom navigation banner always starts
- * below that toolbar instead of being covered by it.
- */
-:root { --streamlit-toolbar-safe-area: 4.75rem; }
-
-.block-container,
-[data-testid="stAppViewBlockContainer"],
-[data-testid="stMainBlockContainer"] {
-  max-width: 1160px !important;
-  padding-top: var(--streamlit-toolbar-safe-area) !important;
-  padding-bottom: 4rem !important;
-  padding-left: 2rem !important;
-  padding-right: 2rem !important;
-  overflow: visible !important;
-}
-
-/* Keep Streamlit's own toolbar readable while preventing it from visually
-   merging with the first app banner. */
-[data-testid="stHeader"] {
-  min-height: 3.75rem !important;
-  background: rgba(250,248,243,.97) !important;
-  border-bottom: 1px solid rgba(214,211,202,.72) !important;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-}
-
-/* Anchor links should also stop below the fixed Streamlit toolbar. */
-html { scroll-padding-top: 5.25rem; }
-
-h1, h2, h3, h4, h5, h6 {
-  color: var(--ink) !important;
-  letter-spacing: -0.025em;
-}
-
-p, li, label, div { color: var(--ink); }
-
-.bb-nav {
-  position: relative;
-  z-index: 3;
-  overflow: visible;
-  border-bottom: 1px solid var(--line);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  min-height: 72px;
-  margin: 0 -2rem;
-  padding: 0 2rem;
-}
-.bb-brand {
-  display: flex;
-  align-items: center;
-  gap: .6rem;
-  font-size: .82rem;
-  font-weight: 500;
-  letter-spacing: -.02em;
-}
-.bb-square { width: 8px; height: 8px; background: var(--ink); display: inline-block; }
-.bb-version { color: var(--muted); font-weight: 400; }
-.bb-nav-right {
-  display: flex;
-  align-items: center;
-  gap: 1.3rem;
-  font-size: .65rem;
-  text-transform: uppercase;
-  letter-spacing: .18em;
-  color: var(--muted);
-}
-.bb-nav-right a { color: var(--ink); text-decoration: none; border: 1px solid var(--ink); padding: .62rem .82rem; }
-
-.bb-ticker {
-  margin: 0 -2rem;
-  border-bottom: 1px solid var(--line);
-  overflow: hidden;
-  white-space: nowrap;
-  display: flex;
-  align-items: stretch;
-  min-height: 40px;
-}
-.bb-ticker-label {
-  background: var(--ink);
-  color: var(--paper);
-  padding: .78rem 1rem;
-  font-size: .59rem;
-  text-transform: uppercase;
-  letter-spacing: .22em;
-  z-index: 2;
-}
-.bb-dot {
-  width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
-  display: inline-block; margin-right: .45rem; animation: bbpulse 1.6s ease-in-out infinite;
-}
-.bb-ticker-track {
-  color: var(--muted);
-  font-size: .64rem;
-  text-transform: uppercase;
-  letter-spacing: .18em;
-  padding: .78rem 0;
-  display: inline-block;
-  min-width: max-content;
-  animation: bbmarquee 45s linear infinite;
-}
-.bb-ticker-track span { margin: 0 1.4rem; color: var(--muted); }
-.bb-ticker:hover .bb-ticker-track { animation-play-state: paused; }
-@keyframes bbmarquee { from { transform: translateX(0); } to { transform: translateX(-35%); } }
-@keyframes bbpulse { 0%,100% { opacity:.35; } 50% { opacity:1; } }
-
-.bb-hero {
-  border-bottom: 1px solid var(--line);
-  margin: 0 -2rem 0;
-  padding: 5.3rem 2rem 4.8rem;
-}
-.bb-hero-inner { max-width: 1000px; margin: 0 auto; }
-.bb-eyebrow {
-  color: var(--muted) !important;
-  font-size: .61rem;
-  text-transform: uppercase;
-  letter-spacing: .28em;
-  margin-bottom: 1.4rem;
-}
-.bb-eyebrow .bb-dot { vertical-align: middle; }
-.bb-display {
-  font-family: "JetBrains Mono", monospace;
-  font-size: clamp(3rem, 7vw, 5.4rem);
-  font-weight: 300;
-  line-height: 1.03;
-  letter-spacing: -.055em;
-  margin: 0;
-  color: var(--ink);
-}
-.bb-display .serif {
-  font-family: "Instrument Serif", Georgia, serif;
-  font-style: italic;
-  font-weight: 400;
-  color: var(--muted);
-  letter-spacing: -.02em;
-}
-.bb-display .accent-word {
-  text-decoration: underline;
-  text-decoration-color: var(--accent);
-  text-decoration-thickness: 3px;
-  text-underline-offset: 11px;
-}
-.bb-lede {
-  max-width: 720px;
-  margin-top: 2.2rem;
-  color: var(--muted) !important;
-  font-size: .91rem;
-  line-height: 1.85;
-}
-.bb-creditline {
-  margin-top: 1.6rem;
-  font-size: .66rem;
-  text-transform: uppercase;
-  letter-spacing: .15em;
-  color: var(--muted) !important;
-}
-.bb-creditline strong { color: var(--ink); font-weight: 500; }
-
-.bb-warning {
-  border-left: 2px solid var(--accent);
-  background: var(--soft);
-  margin: 2rem 0 .7rem;
-  padding: 1rem 1.15rem;
-  font-family: "Instrument Serif", Georgia, serif;
-  font-style: italic;
-  font-size: 1.02rem;
-  line-height: 1.55;
-  color: #4c4941 !important;
-}
-
-.bb-section-kicker {
-  margin-top: 1.2rem;
-  color: var(--muted) !important;
-  font-size: .61rem;
-  text-transform: uppercase;
-  letter-spacing: .27em;
-}
-.bb-section-title {
-  font-family: "Instrument Serif", Georgia, serif;
-  font-size: clamp(2.15rem, 4.2vw, 3.5rem);
-  line-height: 1.08;
-  margin: .55rem 0 1.25rem;
-  color: var(--ink) !important;
-  font-weight: 400;
-}
-.bb-section-copy {
-  max-width: 760px;
-  color: var(--muted) !important;
-  font-size: .83rem;
-  line-height: 1.7;
-  margin-bottom: 1.7rem;
-}
-.bb-rule { border-top: 1px solid var(--line); margin: 2.7rem 0 2.4rem; }
-
-.bb-aside {
-  border-top: 1px solid var(--ink);
-  padding-top: 1rem;
-  margin-top: .2rem;
-}
-.bb-aside-title {
-  color: var(--muted) !important;
-  font-size: .59rem;
-  text-transform: uppercase;
-  letter-spacing: .24em;
-  margin-bottom: .8rem;
-}
-.bb-aside p {
-  color: #5a5650 !important;
-  font-family: "Instrument Serif", Georgia, serif;
-  font-style: italic;
-  font-size: 1.04rem;
-  line-height: 1.5;
-}
-
-.bb-step-grid, .bb-principle-grid, .bb-metric-grid {
-  display: grid;
-  gap: 1.2rem;
-}
-.bb-step-grid { grid-template-columns: repeat(3, minmax(0,1fr)); }
-.bb-principle-grid { grid-template-columns: 5fr 7fr; }
-.bb-metric-grid { grid-template-columns: repeat(5, minmax(0,1fr)); margin-top: 1.3rem; }
-.bb-step, .bb-metric {
-  border-top: 1px solid var(--ink);
-  padding-top: 1.05rem;
-}
-.bb-step-no, .bb-metric-label {
-  color: var(--muted) !important;
-  font-size: .58rem;
-  text-transform: uppercase;
-  letter-spacing: .22em;
-}
-.bb-step h3, .bb-metric-value {
-  font-family: "Instrument Serif", Georgia, serif;
-  font-weight: 400;
-  margin: .65rem 0 .35rem;
-}
-.bb-step h3 { font-size: 1.75rem; }
-.bb-step p { color: var(--muted) !important; font-size: .74rem; line-height: 1.65; }
-.bb-metric-value { font-size: 1.8rem; line-height: 1.1; }
-.bb-metric-sub { color: var(--muted) !important; font-size: .62rem; line-height: 1.45; }
-
-.bb-impact {
-  border-left: 2px solid var(--accent);
-  padding: .4rem 0 .4rem 1.2rem;
-  margin: 1.8rem 0 1.5rem;
-}
-.bb-impact-label {
-  color: var(--muted) !important;
-  font-size: .58rem;
-  text-transform: uppercase;
-  letter-spacing: .24em;
-}
-.bb-impact-headline {
-  font-family: "Instrument Serif", Georgia, serif;
-  font-size: 1.65rem;
-  line-height: 1.35;
-  margin-top: .45rem;
-}
-.bb-range-strip {
-  border-top: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
-  padding: .9rem 0;
-  color: #5a5650 !important;
-  font-family: "Instrument Serif", Georgia, serif;
-  font-style: italic;
-  line-height: 1.55;
-  margin: 1rem 0 1.5rem;
-}
-
-.bb-principles {
-  border-top: 1px solid var(--line);
-  margin: 4.5rem -2rem 0;
-  padding: 4rem 2rem 1.2rem;
-}
-.bb-principles h2 {
-  font-family: "JetBrains Mono", monospace;
-  font-weight: 300;
-  font-size: 2.4rem;
-  line-height: 1.15;
-  margin: 1rem 0;
-}
-.bb-principles h2 em { font-family:"Instrument Serif", Georgia, serif; color:var(--muted); font-weight:400; }
-.bb-principle-list { border-top: 1px solid var(--line); }
-.bb-principle-item {
-  display:flex; gap:1rem; border-bottom:1px solid var(--line); padding: 1rem 0;
-  font-size:.77rem; line-height:1.6;
-}
-.bb-arrow { color: var(--accent) !important; }
-
-.bb-footer {
-  border-top: 1px solid var(--line);
-  margin: 3rem -2rem 0;
-  padding: 1.6rem 2rem .5rem;
-  display: flex;
-  justify-content: space-between;
-  gap: 1.2rem;
-  flex-wrap: wrap;
-  color: var(--muted) !important;
-  font-size: .59rem;
-  text-transform: uppercase;
-  letter-spacing: .2em;
-}
-
-/* Streamlit tabs — translated from the attached sticky editorial tab strip. */
-.stTabs [data-baseweb="tab-list"] {
-  gap: 0 !important;
-  border-top: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
-  background: var(--paper);
-  margin-top: 1.6rem;
-}
-.stTabs [data-baseweb="tab"] {
-  height: 54px;
-  padding: 0 1.2rem !important;
-  color: var(--muted) !important;
-  font-family: "JetBrains Mono", monospace !important;
-  font-size: .64rem !important;
-  text-transform: uppercase;
-  letter-spacing: .18em;
-}
-.stTabs [aria-selected="true"] { color: var(--ink) !important; }
-.stTabs [data-baseweb="tab-highlight"] { background-color: var(--ink) !important; height: 1px !important; }
-.stTabs [data-baseweb="tab-border"] { display: none; }
-
-/* Streamlit inputs */
-.stRadio label, .stCheckbox label, .stSelectbox label, .stNumberInput label,
-.stTextArea label, .stFileUploader label, .stTextInput label {
-  font-family: "JetBrains Mono", monospace !important;
-  font-size: .66rem !important;
-  letter-spacing: .04em;
-}
-.stTextArea textarea, .stTextInput input, .stNumberInput input,
-[data-baseweb="select"] > div {
-  border-radius: 0 !important;
-  border-color: var(--line) !important;
-  background: #fffdf8 !important;
-  color: var(--ink) !important;
-  box-shadow: none !important;
-}
-[data-testid="stFileUploaderDropzone"] {
-  border-radius: 0 !important;
-  border: 1px dashed #aaa59a !important;
-  background: #fffdf8 !important;
-  padding: 1.2rem !important;
-}
-[data-testid="stFileUploaderDropzoneInstructions"] * { color: var(--muted) !important; }
-
-.stButton > button, .stDownloadButton > button {
-  border-radius: 0 !important;
-  border: 1px solid var(--ink) !important;
-  background: transparent !important;
-  color: var(--ink) !important;
-  font-family: "JetBrains Mono", monospace !important;
-  font-size: .64rem !important;
-  text-transform: uppercase;
-  letter-spacing: .16em;
-  min-height: 44px;
-  transition: all .15s ease;
-}
-.stButton > button:hover, .stDownloadButton > button:hover {
-  background: var(--ink) !important;
-  color: var(--paper) !important;
-  border-color: var(--ink) !important;
-}
-.stButton > button[kind="primary"] {
-  background: var(--ink) !important;
-  color: var(--paper) !important;
-}
-.stButton > button[kind="primary"]:hover {
-  background: var(--accent) !important;
-  border-color: var(--accent) !important;
-}
-
-[data-testid="stExpander"] {
-  border: 1px solid var(--line) !important;
-  border-radius: 0 !important;
-  background: transparent !important;
-}
-[data-testid="stDataFrame"] { border: 1px solid var(--line); }
-
-/* Alerts & progress */
-[data-testid="stAlert"] { border-radius: 0 !important; }
-[data-testid="stProgress"] > div > div > div > div { background-color: var(--accent) !important; }
-
-/* Markdown report styling */
-[data-testid="stMarkdownContainer"] h1,
-[data-testid="stMarkdownContainer"] h2,
-[data-testid="stMarkdownContainer"] h3 {
-  font-family: "Instrument Serif", Georgia, serif !important;
-  font-weight: 400 !important;
-}
-[data-testid="stMarkdownContainer"] table { font-size: .75rem; }
-[data-testid="stMarkdownContainer"] blockquote {
-  border-left: 2px solid var(--accent);
-  color: #5a5650;
-  font-family: "Instrument Serif", Georgia, serif;
-  font-style: italic;
-}
-
-@media (max-width: 900px) {
-  .bb-nav-right span { display:none; }
-  .bb-hero { padding-top: 3.6rem; padding-bottom: 3.7rem; }
-  .bb-step-grid, .bb-metric-grid, .bb-principle-grid { grid-template-columns: 1fr; }
-  .bb-metric { padding-bottom: .4rem; }
-  .block-container,
-  [data-testid="stAppViewBlockContainer"],
-  [data-testid="stMainBlockContainer"] {
-    padding-top: 4.5rem !important;
-    padding-left: 1.15rem !important;
-    padding-right: 1.15rem !important;
-  }
-  .bb-nav, .bb-ticker, .bb-hero, .bb-principles, .bb-footer { margin-left:-1.15rem; margin-right:-1.15rem; }
-  .bb-nav, .bb-hero, .bb-principles, .bb-footer { padding-left:1.15rem; padding-right:1.15rem; }
-}
-</style>
-""",
-    unsafe_allow_html=True,
-)
+def secret_value(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    try:
+        candidate = st.secrets.get(name, "")
+        return str(candidate).strip() if candidate else ""
+    except Exception:
+        return ""
 
 
-@st.cache_resource(show_spinner="Loading trained ML + neural ensemble…")
-def get_models():
-    bundle = load_bundle(MODEL_PATH)
-    dnn_state = build_dnn_from_bundle(bundle)
-    return bundle, dnn_state
+def active_api_key() -> str:
+    return str(st.session_state.get("session_api_key") or secret_value("CONGRESS_API_KEY") or "").strip()
 
 
-def extract_text_from_upload(uploaded_file) -> str:
-    suffix = Path(uploaded_file.name).suffix.lower()
-    raw = uploaded_file.getvalue()
-
-    if suffix in {".txt", ".md", ".csv"}:
-        return raw.decode("utf-8", errors="ignore")
-
-    if suffix == ".pdf":
-        text_parts: list[str] = []
-        try:
-            from pypdf import PdfReader
-
-            reader = PdfReader(io.BytesIO(raw))
-            text_parts = [(page.extract_text() or "") for page in reader.pages]
-        except Exception:
-            text_parts = []
-
-        text = "\n".join(text_parts).strip()
-        if len(text) >= 40:
-            return text
-
-        from pdf2image import convert_from_bytes
-        import pytesseract
-
-        images = convert_from_bytes(raw, dpi=220)
-        return "\n".join(pytesseract.image_to_string(img) for img in images).strip()
-
-    if suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}:
-        from PIL import Image
-        import pytesseract
-
-        return pytesseract.image_to_string(Image.open(io.BytesIO(raw))).strip()
-
-    raise ValueError(f"Unsupported file type: {suffix}")
-
-
-def section_intro(kicker: str, title: str, copy: str) -> None:
-    st.markdown(
-        f"""
-<div class="bb-section-kicker">{html.escape(kicker)}</div>
-<div class="bb-section-title">{html.escape(title)}</div>
-<div class="bb-section-copy">{html.escape(copy)}</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-
-def impact_headline(risk_level: str) -> str:
+def demo_bundle() -> dict[str, Any]:
     return {
-        "low": "The model sees a lower relative impact profile — verify the official consequences before acting.",
-        "medium": "The model sees a meaningful impact profile that deserves deadline and consequence verification.",
-        "high": "The model flags a higher synthetic impact profile — prioritize official verification and qualified guidance.",
-    }.get(risk_level, "Review the modeled ranges and verify every consequence with an official source.")
+        "ref": {
+            "congress": 119,
+            "bill_type": "hr",
+            "number": 99999,
+            "bill_id": "demo-hr-99999",
+            "citation": "H.R. DEMO",
+            "official_url": "",
+        },
+        "detail": {
+            "title": "Digital Skills and Rural Clinic Support Act of 2026 (fictional demonstration)",
+            "introducedDate": "2026-02-12",
+            "originChamber": "House",
+            "policyArea": {"name": "Education"},
+            "latestAction": {
+                "actionDate": "2026-02-12",
+                "text": "Fictional demonstration: referred to the Committees on Education and the Workforce and Energy and Commerce.",
+            },
+            "sponsors": [
+                {
+                    "fullName": "Representative Demo Sponsor",
+                    "party": "—",
+                    "state": "—",
+                    "district": "—",
+                }
+            ],
+            "cboCostEstimates": [],
+        },
+        "actions": [
+            {
+                "actionDate": "2026-02-12",
+                "text": "Fictional demonstration: introduced in House and referred to committee.",
+            }
+        ],
+        "amendments": [],
+        "committees": [
+            {"name": "Committee on Education and the Workforce (fictional demo)"},
+            {"name": "Committee on Energy and Commerce (fictional demo)"},
+        ],
+        "cosponsors": [],
+        "related_bills": [],
+        "subjects": {"legislativeSubjects": [{"name": "Digital skills"}, {"name": "Rural health"}]},
+        "summaries": [
+            {
+                "actionDate": "2026-02-12",
+                "text": "Fictional demonstration summary: establishes rural digital-skills and telehealth grant programs and authorizes appropriations.",
+                "versionCode": "00",
+            }
+        ],
+        "text_versions": [],
+        "titles": [],
+        "errors": {},
+    }
 
 
-def render_metrics(pred) -> None:
-    risk = html.escape(pred.risk_level.upper())
-    st.markdown(
-        f"""
-<div class="bb-metric-grid">
-  <div class="bb-metric">
-    <div class="bb-metric-label">Insurance estimate</div>
-    <div class="bb-metric-value">{pred.insurance_mid_pct:.1f}%</div>
-    <div class="bb-metric-sub">synthetic ensemble midpoint</div>
-  </div>
-  <div class="bb-metric">
-    <div class="bb-metric-label">Impact duration</div>
-    <div class="bb-metric-value">{pred.duration_mid_years:.1f} yr</div>
-    <div class="bb-metric-sub">modeled duration midpoint</div>
-  </div>
-  <div class="bb-metric">
-    <div class="bb-metric-label">License points</div>
-    <div class="bb-metric-value">{pred.license_points_mid:.1f}</div>
-    <div class="bb-metric-sub">prototype estimate only</div>
-  </div>
-  <div class="bb-metric">
-    <div class="bb-metric-label">Escalation risk</div>
-    <div class="bb-metric-value">{100 * pred.escalation_probability:.1f}%</div>
-    <div class="bb-metric-sub">classification probability</div>
-  </div>
-  <div class="bb-metric">
-    <div class="bb-metric-label">Impact category</div>
-    <div class="bb-metric-value">{risk}</div>
-    <div class="bb-metric-sub">synthetic training category</div>
-  </div>
-</div>
-""",
-        unsafe_allow_html=True,
+def extract_pdf_text(raw: bytes) -> str:
+    reader = PdfReader(io.BytesIO(raw))
+    text = "\n\n".join((page.extract_text() or "") for page in reader.pages)
+    text = re.sub(r"\r\n?", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) < 80:
+        raise ValueError(
+            "The PDF contains too little extractable text. Upload a searchable/text PDF or paste the bill text. "
+            "This lightweight Streamlit build does not install OCR system packages."
+        )
+    return text
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_bill_bundle(api_key: str, congress: int, bill_type: str, number: int) -> dict[str, Any]:
+    client = CongressClient(api_key)
+    return client.get_bill_bundle(BillRef(int(congress), bill_type, int(number)))
+
+
+@st.cache_data(ttl=86_400, show_spinner=False)
+def cached_current_congress(api_key: str) -> int:
+    return CongressClient(api_key).get_current_congress()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_official_text(api_key: str, url: str, source_format: str) -> dict[str, str]:
+    client = CongressClient(api_key)
+    downloaded = client.download_text_url(url, source_format)
+    return asdict(downloaded)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_recent_bills(api_key: str, congress: int, bill_type: str, limit: int = 40) -> list[dict[str, Any]]:
+    return CongressClient(api_key).list_bills(congress, bill_type, limit=limit)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def cached_members(api_key: str, state: str, district: int | None) -> list[dict[str, Any]]:
+    return CongressClient(api_key).get_current_members(state, district)
+
+
+def version_label(version: Mapping[str, Any], index: int = 0) -> str:
+    date = str(version.get("date") or "date unavailable")
+    version_type = str(version.get("type") or version.get("versionName") or "official text")
+    return f"{date} · {version_type} · version {index + 1}"
+
+
+def official_text_for_version(api_key: str, version: Mapping[str, Any]) -> dict[str, str]:
+    fmt = preferred_text_format(dict(version))
+    if not fmt:
+        raise CongressAPIError("The selected official version does not include a downloadable text format.")
+    return cached_official_text(api_key, str(fmt.get("url") or ""), str(fmt.get("type") or "Official text"))
+
+
+def store_document(
+    *,
+    text: str,
+    title: str,
+    citation: str,
+    source_kind: str,
+    bundle: Mapping[str, Any] | None = None,
+    source_url: str = "",
+    source_name: str = "",
+    selected_version: Mapping[str, Any] | None = None,
+) -> None:
+    st.session_state["working_document"] = {
+        "text": text,
+        "title": title,
+        "citation": citation,
+        "source_kind": source_kind,
+        "bundle": dict(bundle or {}),
+        "source_url": source_url,
+        "source_name": source_name,
+        "selected_version": dict(selected_version or {}),
+    }
+    # A new source/version invalidates analysis artifacts created for the prior
+    # document. Clearing them prevents a stale version diff, comparison, or
+    # profile result from being displayed beside a newly loaded bill.
+    for stale_key in ("analysis", "personalization", "version_diff", "compare_analysis"):
+        st.session_state.pop(stale_key, None)
+
+
+def load_live_bill(api_key: str, ref: BillRef) -> None:
+    with st.spinner(f"Retrieving {ref.display} metadata, actions, summaries, and text versions from Congress.gov…"):
+        bundle = cached_bill_bundle(api_key, ref.congress, ref.bill_type, ref.number)
+    versions = [item for item in bundle.get("text_versions", []) if isinstance(item, dict)]
+    version = latest_text_version(versions)
+    if not version:
+        raise CongressAPIError(
+            "Congress.gov returned the bill metadata, but no downloadable full-text version is currently available. "
+            "Open the official source or try again after a text version is published."
+        )
+    with st.spinner("Downloading the latest official bill text…"):
+        downloaded = official_text_for_version(api_key, version)
+    detail = bundle.get("detail") if isinstance(bundle.get("detail"), Mapping) else {}
+    store_document(
+        text=downloaded["text"],
+        title=str(detail.get("title") or ref.display),
+        citation=ref.citation,
+        source_kind="official Congress.gov text",
+        bundle=bundle,
+        source_url=downloaded.get("source_url", ref.official_url),
+        source_name=ref.bill_id,
+        selected_version=version,
     )
 
 
-# Top navigation translated from the attached UI.
-st.markdown(
-    """
-<div class="bb-nav">
-  <div class="bb-brand">
-    <span class="bb-square"></span>
-    <span>court_impact</span>
-    <span class="bb-version">/v2.1</span>
-  </div>
-  <div class="bb-nav-right">
-    <span>AI research prototype</span>
-    <a href="#analysis-workbench">Analyze a notice</a>
-  </div>
-</div>
-<div class="bb-ticker">
-  <div class="bb-ticker-label"><span class="bb-dot"></span>model notes</div>
-  <div class="bb-ticker-track">
-    <span>synthetic demo data · not legal advice</span> ·
-    <span>scikit-learn + PyTorch-trained DNN</span> ·
-    <span>NumPy cloud inference</span> ·
-    <span>OCR + transparent parsing</span> ·
-    <span>calibrated ranges</span> ·
-    <span>human verification required</span> ·
-    <span>synthetic demo data · not legal advice</span> ·
-    <span>scikit-learn + PyTorch-trained DNN</span> ·
-    <span>NumPy cloud inference</span> ·
-    <span>OCR + transparent parsing</span> ·
-  </div>
-</div>
-""",
-    unsafe_allow_html=True,
+def render_api_key_box(prefix: str) -> str:
+    existing = active_api_key()
+    if existing:
+        st.success("Congress.gov API access is configured for this session.")
+        return existing
+    st.info(
+        "Live lookup requires a free Congress.gov API key. Add `CONGRESS_API_KEY` to Streamlit secrets, "
+        "or enter a key below for this browser session. The key is not written to the app database."
+    )
+    entered = st.text_input("Congress.gov API key", type="password", key=f"{prefix}_api_key")
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("USE API KEY FOR THIS SESSION", key=f"{prefix}_save_api_key", use_container_width=True):
+            if entered.strip():
+                st.session_state["session_api_key"] = entered.strip()
+                st.rerun()
+            st.error("Enter an API key first.")
+    with c2:
+        st.link_button("GET A FREE OFFICIAL API KEY ↗", API_SIGNUP_URL, use_container_width=True)
+    return active_api_key()
+
+
+def source_link_override(analysis: BillAnalysis, url: str) -> None:
+    if url:
+        analysis.source_links["official_bill_page"] = url
+        analysis.source_links["official_text"] = url
+        if not analysis.source_links.get("official_summary"):
+            analysis.source_links["official_summary"] = url
+
+
+def current_analysis() -> BillAnalysis | None:
+    value = st.session_state.get("analysis")
+    return value if isinstance(value, BillAnalysis) else None
+
+
+def current_document() -> dict[str, Any] | None:
+    value = st.session_state.get("working_document")
+    return value if isinstance(value, dict) else None
+
+
+def action_snapshot(bundle: Mapping[str, Any]) -> tuple[str, str]:
+    detail = bundle.get("detail") if isinstance(bundle.get("detail"), Mapping) else {}
+    latest = detail.get("latestAction") if isinstance(detail.get("latestAction"), Mapping) else {}
+    if latest:
+        return str(latest.get("actionDate") or ""), str(latest.get("text") or "")
+    actions = [item for item in bundle.get("actions", []) if isinstance(item, Mapping)]
+    if not actions:
+        return "", ""
+    latest_action = max(actions, key=lambda item: str(item.get("actionDate") or ""))
+    return str(latest_action.get("actionDate") or ""), str(latest_action.get("text") or "")
+
+
+def member_display(member: Mapping[str, Any]) -> dict[str, Any]:
+    terms = member.get("terms")
+    term_list: list[Any] = []
+    if isinstance(terms, dict):
+        term_list = terms.get("item") if isinstance(terms.get("item"), list) else []
+    elif isinstance(terms, list):
+        term_list = terms
+    latest_term = term_list[-1] if term_list else {}
+    if not isinstance(latest_term, Mapping):
+        latest_term = {}
+    return {
+        "Name": member.get("name") or member.get("directOrderName") or "Unknown",
+        "Party": member.get("partyName") or member.get("party") or latest_term.get("partyName") or "",
+        "State": member.get("state") or latest_term.get("stateCode") or "",
+        "District": member.get("district") or latest_term.get("district") or "",
+        "Chamber": latest_term.get("chamber") or "",
+        "Bioguide ID": member.get("bioguideId") or "",
+    }
+
+
+def render_analysis_results(analysis: BillAnalysis, document: Mapping[str, Any]) -> None:
+    st.markdown('<div class="bb-rule"></div>', unsafe_allow_html=True)
+    section_intro(
+        "analysis results / official text remains primary",
+        f"{analysis.citation}: {analysis.title}",
+        "The AI output is a navigational layer over the source text. Use the official links and section text to verify every paraphrase.",
+    )
+    metric_cards(
+        [
+            ("Legislative stage", analysis.status.label.title(), f"{analysis.status.confidence} source confidence"),
+            ("Analysis confidence", str(analysis.confidence.get("label", "unknown")).title(), f"{analysis.confidence.get('score', 0)}/{analysis.confidence.get('maximum', 9)} source score"),
+            ("Sections mapped", str(len(analysis.sections)), f"{analysis.metadata.get('word_count', 0):,} words analyzed"),
+        ]
+    )
+    source_box(analysis.source_links)
+    for warning in analysis.warnings:
+        st.caption(f"⚠ {warning}")
+
+    overview, sections_tab, purpose_tab, fiscal_tab, process_tab, glossary_tab, versions_tab, metadata_tab = st.tabs(
+        [
+            "OVERVIEW",
+            "SECTION BREAKDOWN",
+            "CLAIMS VS OPERATIVE TEXT",
+            "FISCAL / CBO",
+            "STATUS + TIMELINE",
+            "GLOSSARY",
+            "VERSIONS",
+            "OFFICIAL METADATA",
+        ]
+    )
+
+    with overview:
+        section_intro("plain-English AI summary", "What the bill says, condensed.", "Extractive NLP selects and simplifies the most central provisions while preserving a path back to the official text.")
+        callout(analysis.plain_summary, "Read the source sections below before relying on this paraphrase.", "plain-English summary")
+        if analysis.topics:
+            st.markdown("**Detected subject areas:** " + " · ".join(analysis.topics))
+        st.markdown("### Confidence and uncertainty")
+        for reason in analysis.confidence.get("reasons", []):
+            st.write(f"- {reason}")
+        st.info(str(analysis.confidence.get("uncertainty_note", "")))
+        st.markdown("### Official summary, when available")
+        summaries = [item for item in document.get("bundle", {}).get("summaries", []) if isinstance(item, Mapping)]
+        if summaries:
+            newest = max(summaries, key=lambda item: str(item.get("updateDate") or item.get("actionDate") or ""))
+            official_summary = re.sub(r"<[^>]+>", " ", str(newest.get("text") or ""))
+            official_summary = re.sub(r"\s+", " ", official_summary).strip()
+            st.write(official_summary or "The official summary record did not include readable text.")
+        else:
+            st.caption("No official summary was returned for this source. This is common for newly introduced measures or manual uploads.")
+
+    with sections_tab:
+        section_intro("long-form bill navigation", "Every section gets its own map.", "Sections are summarized separately so a long measure is not reduced to one global paragraph.")
+        section_rows = [
+            {
+                "Section": item.number,
+                "Title": item.title,
+                "Words": item.word_count,
+                "Topics": ", ".join(item.topics),
+                "Confidence": item.confidence,
+            }
+            for item in analysis.sections
+        ]
+        st.dataframe(pd.DataFrame(section_rows), use_container_width=True, hide_index=True)
+        for item in analysis.sections:
+            with st.expander(f"SECTION {item.number} — {item.title}", expanded=False):
+                st.markdown(f"**Plain-English section summary:** {item.summary}")
+                if item.operative_points:
+                    st.markdown("**Operative points detected:**")
+                    for point in item.operative_points:
+                        st.write(f"- {point}")
+                cols = st.columns(3)
+                cols[0].write("**Topics**")
+                cols[0].write(", ".join(item.topics) or "No clear topic")
+                cols[1].write("**Dates / deadlines**")
+                cols[1].write(", ".join(item.dates) or "None detected")
+                cols[2].write("**Dollar references**")
+                cols[2].write(", ".join(item.dollar_amounts) or "None detected")
+                if item.key_terms:
+                    st.markdown("**Inline term definitions:**")
+                    for term in item.key_terms:
+                        definition = analysis.glossary.get(term, "See the bill's definitions section and official procedural guidance.")
+                        st.write(f"- **{term.title()}** — {definition}")
+                with st.expander("VIEW SOURCE TEXT FOR THIS SECTION", expanded=False):
+                    st.text_area(
+                        f"Official/source text — section {item.number}",
+                        value=item.raw_text,
+                        height=260,
+                        disabled=True,
+                        key=f"section_raw_{item.number}_{hash(item.title)}",
+                    )
+
+    with purpose_tab:
+        section_intro("purpose versus operation", "What it says it is for — and what the clauses do.", "The left side is derived from the title, findings, and official summary. The right side emphasizes mandatory, permissive, amending, spending, and reporting language.")
+        left, right = st.columns(2, gap="large")
+        with left:
+            st.markdown("### Stated purpose / official framing")
+            st.write(analysis.stated_purpose)
+        with right:
+            st.markdown("### Operative effect detected in the text")
+            st.write(analysis.operative_effect)
+        st.markdown("### Possible scope-mismatch review signals")
+        if analysis.scope_mismatch_flags:
+            st.warning(
+                "These flags identify vocabulary that appears outside the bill's main detected topics. They do not prove that a section is a rider or unrelated amendment."
+            )
+            st.dataframe(pd.DataFrame(analysis.scope_mismatch_flags), use_container_width=True, hide_index=True)
+        else:
+            st.success("No strong section-level scope mismatch was detected by the vocabulary heuristic.")
+        amendments = [item for item in document.get("bundle", {}).get("amendments", []) if isinstance(item, Mapping)]
+        st.markdown("### Linked amendments")
+        if amendments:
+            amendment_rows = []
+            for item in amendments:
+                amendment_rows.append(
+                    {
+                        "Amendment": item.get("number") or item.get("type") or item.get("url") or "Record",
+                        "Purpose": item.get("purpose") or item.get("description") or "",
+                        "Latest action": (item.get("latestAction") or {}).get("text") if isinstance(item.get("latestAction"), Mapping) else "",
+                        "URL": item.get("url") or "",
+                    }
+                )
+            st.dataframe(pd.DataFrame(amendment_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No amendment records were returned for this source.")
+
+    with fiscal_tab:
+        section_intro("budget lens", "Spending, revenue, appropriations, and CBO records.", "The app highlights text signals and Congress.gov CBO metadata. It does not calculate a federal budget score.")
+        fiscal = analysis.fiscal
+        c1, c2, c3 = st.columns(3)
+        c1.metric("CBO estimate record", "Available" if fiscal.get("has_cbo_estimate") else "Not returned")
+        c2.metric("Dollar references", len(fiscal.get("detected_amounts", [])))
+        c3.metric("Fiscal terms", len(fiscal.get("detected_terms", [])))
+        st.info(fiscal.get("caution", ""))
+        if fiscal.get("cbo_estimates"):
+            st.markdown("### Congress.gov CBO cost-estimate metadata")
+            st.dataframe(pd.DataFrame(fiscal["cbo_estimates"]), use_container_width=True, hide_index=True)
+            cbo_links = []
+            for index, estimate in enumerate(fiscal["cbo_estimates"], start=1):
+                if not isinstance(estimate, Mapping):
+                    continue
+                url = str(estimate.get("url") or estimate.get("cboUrl") or "").strip()
+                if url:
+                    label = str(estimate.get("title") or estimate.get("description") or f"CBO estimate {index}")
+                    cbo_links.append((label[:90], url))
+            for label, url in cbo_links[:8]:
+                st.link_button(f"OPEN CBO RECORD — {label} ↗", url, use_container_width=True)
+        if fiscal.get("detected_terms"):
+            st.markdown("**Detected fiscal language:** " + ", ".join(fiscal["detected_terms"]))
+        if fiscal.get("section_amounts"):
+            st.markdown("### Dollar references by section")
+            st.dataframe(pd.DataFrame(fiscal["section_amounts"]), use_container_width=True, hide_index=True)
+        elif not fiscal.get("cbo_estimates"):
+            st.caption("No CBO estimate record or explicit dollar amount was detected in the retrieved material.")
+
+    with process_tab:
+        section_intro("legislative process", "Current stage, evidence, and effective-date signals.", "Status is inferred from official action history when available. Manual uploads receive a conservative low-confidence label.")
+        callout(analysis.status.label.title(), analysis.status.explanation, f"{analysis.status.confidence} confidence")
+        if analysis.status.evidence:
+            st.markdown("### Status evidence")
+            for item in analysis.status.evidence:
+                st.write(f"- {item}")
+        if analysis.timeline:
+            st.markdown("### Timeline")
+            st.dataframe(pd.DataFrame(analysis.timeline), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No official action timeline was available.")
+
+    with glossary_tab:
+        section_intro("inline terminology", "Legal and procedural terms, decoded.", "Definitions are general educational explanations. The bill's own definitions control within the legislation.")
+        if analysis.glossary:
+            for term, definition in analysis.glossary.items():
+                st.markdown(f"**{term.title()}** — {definition}")
+        else:
+            st.caption("No glossary terms from the built-in dictionary were detected.")
+
+    with versions_tab:
+        section_intro("amendment awareness", "Compare official text versions line by line.", "Bills change during the process. Select two Congress.gov text versions to see additions and removals.")
+        versions = [item for item in document.get("bundle", {}).get("text_versions", []) if isinstance(item, Mapping)]
+        api_key = active_api_key()
+        if len(versions) >= 2 and api_key:
+            options = list(range(len(versions)))
+            left_index = st.selectbox(
+                "Older/base version",
+                options,
+                index=max(0, len(versions) - 1),
+                format_func=lambda i: version_label(versions[i], i),
+                key="version_left",
+            )
+            right_index = st.selectbox(
+                "Newer/comparison version",
+                options,
+                index=0,
+                format_func=lambda i: version_label(versions[i], i),
+                key="version_right",
+            )
+            if st.button("COMPARE SELECTED OFFICIAL VERSIONS", key="run_version_diff", use_container_width=True):
+                try:
+                    with st.spinner("Downloading and comparing official versions…"):
+                        old = official_text_for_version(api_key, versions[left_index])
+                        new = official_text_for_version(api_key, versions[right_index])
+                        diff = version_diff(old["text"], new["text"])
+                    st.session_state["version_diff"] = diff
+                except Exception as exc:
+                    st.error(f"Version comparison failed: {exc}")
+            diff = st.session_state.get("version_diff")
+            if isinstance(diff, Mapping):
+                c1, c2 = st.columns(2)
+                c1.metric("Added lines", diff.get("added_lines", 0))
+                c2.metric("Removed lines", diff.get("removed_lines", 0))
+                st.write(diff.get("summary", ""))
+                diff_text = str(diff.get("unified_diff") or "No line-level changes.")
+                st.code(diff_text, language="diff")
+                st.download_button(
+                    "DOWNLOAD VERSION DIFF",
+                    data=diff_text,
+                    file_name=f"{re.sub(r'[^A-Za-z0-9_-]+', '_', analysis.citation)}_version_diff.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                    key="download_version_diff",
+                )
+                if diff.get("truncated"):
+                    st.warning("The displayed diff was truncated for browser performance.")
+        elif versions:
+            st.info("One official text version is available. Version comparison becomes available after another version is published.")
+        else:
+            st.info("Version tracking requires a live Congress.gov bill with at least two published text versions.")
+        if versions:
+            st.markdown("### Published versions")
+            rows = []
+            for index, version in enumerate(versions):
+                fmt = preferred_text_format(dict(version))
+                rows.append(
+                    {
+                        "Version": version_label(version, index),
+                        "Type": version.get("type") or "",
+                        "Date": version.get("date") or "",
+                        "Official format": (fmt or {}).get("type") or "",
+                        "Official URL": (fmt or {}).get("url") or "",
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    with metadata_tab:
+        section_intro("source record", "Sponsors, cosponsors, committees, votes, and related measures.", "These records come from the current source bundle. Open official links for the complete and most current record.")
+        bundle = document.get("bundle", {})
+        sponsors = sponsor_rows(bundle)
+        if sponsors:
+            st.markdown("### Sponsor and cosponsors")
+            st.dataframe(pd.DataFrame(sponsors), use_container_width=True, hide_index=True)
+        committees = [item for item in bundle.get("committees", []) if isinstance(item, Mapping)]
+        if committees:
+            st.markdown("### Committees")
+            st.dataframe(pd.DataFrame(committees), use_container_width=True, hide_index=True)
+        votes = extract_votes(bundle)
+        st.markdown("### Recorded vote links / roll-call references")
+        if votes:
+            st.dataframe(pd.DataFrame(votes), use_container_width=True, hide_index=True)
+        else:
+            action_votes = []
+            for action in bundle.get("actions", []):
+                if not isinstance(action, Mapping):
+                    continue
+                text = str(action.get("text") or "")
+                if re.search(r"\bvote|roll(?: call| no\.)|yeas|nays\b", text, flags=re.I):
+                    action_votes.append({"date": action.get("actionDate") or "", "action": text})
+            if action_votes:
+                st.dataframe(pd.DataFrame(action_votes), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No recorded-vote metadata was returned in the bill action bundle.")
+        related = [item for item in bundle.get("related_bills", []) if isinstance(item, Mapping)]
+        if related:
+            st.markdown("### Related bills")
+            st.dataframe(pd.DataFrame(related), use_container_width=True, hide_index=True)
+        with st.expander("VIEW RAW RETRIEVED METADATA", expanded=False):
+            st.json(bundle)
+
+    st.markdown("### Download this analysis")
+    personalization = st.session_state.get("personalization")
+    c1, c2 = st.columns(2)
+    c1.download_button(
+        "DOWNLOAD MARKDOWN REPORT",
+        data=analysis_to_markdown(analysis, personalization if isinstance(personalization, Mapping) else None),
+        file_name=f"{re.sub(r'[^A-Za-z0-9_-]+', '_', analysis.citation)}_analysis.md",
+        mime="text/markdown",
+        use_container_width=True,
+    )
+    c2.download_button(
+        "DOWNLOAD JSON REPORT",
+        data=analysis_to_json(analysis, personalization if isinstance(personalization, Mapping) else None),
+        file_name=f"{re.sub(r'[^A-Za-z0-9_-]+', '_', analysis.citation)}_analysis.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Header
+# -----------------------------------------------------------------------------
+top_chrome(visitor_count)
+hero()
+
+if st.session_state.get("persistence_error"):
+    st.warning(
+        "The prototype database is unavailable, so visitor counting, accounts, saved profiles, follows, and notifications are disabled for this session. "
+        f"Technical detail: {st.session_state['persistence_error']}"
+    )
+
+main_tab, personal_tab, civic_tab, compare_tab, account_tab, methodology_tab = st.tabs(
+    [
+        "ANALYZE A BILL",
+        "HOW THIS AFFECTS YOU",
+        "FOLLOW + CONTACT",
+        "COMPARE BILLS",
+        "ACCOUNT",
+        "METHODOLOGY",
+    ]
 )
 
-st.markdown(
-    """
-<section class="bb-hero">
-  <div class="bb-hero-inner">
-    <div class="bb-eyebrow"><span class="bb-dot"></span>educational prototype · privacy-first · explainable workflow</div>
-    <h1 class="bb-display">court bills,<br><span class="serif">in plain</span> <span class="accent-word">English.</span></h1>
-    <div class="bb-lede">
-      Upload or paste a redacted court-issued notice, citation, fine, or bill. The prototype extracts structured facts,
-      runs a classical ML + neural-network ensemble, and produces a readable impact report with calibrated ranges.
-    </div>
-    <div class="bb-creditline"><strong>Author: Claire Yuan</strong> &nbsp;·&nbsp; <strong>Advisor: Dr. Qingyang Xiao</strong> &nbsp;·&nbsp; MIT License</div>
-  </div>
-</section>
-<div class="bb-warning">
-  Educational research prototype only. The bundled model is trained on synthetic demonstration data. It does not provide legal advice,
-  determine guilt, predict an official court disposition, or establish insurer or credit-bureau action.
-</div>
-<div id="analysis-workbench"></div>
-""",
-    unsafe_allow_html=True,
-)
 
-main_tab, methodology_tab, about_tab = st.tabs(
-    ["ANALYZE A NOTICE", "MODEL METHODOLOGY", "ABOUT + DEPLOYMENT"]
-)
-
+# -----------------------------------------------------------------------------
+# Analyze tab
+# -----------------------------------------------------------------------------
 with main_tab:
     section_intro(
-        "analysis workbench / step 01",
-        "Bring the notice. We’ll map the possible impact.",
-        "Choose a redacted file, paste text, or use the bundled demo. The visual layer follows the attached editorial UI while the original Streamlit ML pipeline remains intact.",
+        "input + ingestion / step 01",
+        "Start with a live bill, PDF, or pasted text.",
+        "Live mode pulls full text and metadata from the official Congress.gov API. Manual modes preserve an optional source link but cannot verify that the text is the latest version.",
+    )
+    input_mode = st.radio(
+        "Input method",
+        ["Live Congress.gov bill", "Paste bill text", "Upload bill PDF", "Use fictional demo bill"],
+        horizontal=True,
+        key="input_mode",
     )
 
-    left, right = st.columns([1.65, 0.75], gap="large")
-    with left:
-        input_mode = st.radio(
-            "Input method",
-            ["Upload a document", "Paste text", "Use demo notice"],
-            horizontal=True,
-        )
+    candidate_document: dict[str, Any] | None = None
 
-        source_text = ""
-        source_name = ""
-
-        if input_mode == "Upload a document":
-            uploaded = st.file_uploader(
-                "Upload a redacted PDF, image, TXT, CSV, or Markdown file",
-                type=["pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp", "txt", "csv", "md"],
+    if input_mode == "Live Congress.gov bill":
+        api_key = render_api_key_box("live")
+        if api_key:
+            try:
+                current_congress = cached_current_congress(api_key)
+            except Exception:
+                current_congress = current_congress_fallback()
+            lookup_mode = st.radio(
+                "Live lookup method",
+                ["Enter a bill number", "Browse recent bills"],
+                horizontal=True,
+                key="live_lookup_mode",
             )
-            if uploaded is not None:
-                try:
-                    with st.spinner("Extracting document text…"):
-                        source_text = extract_text_from_upload(uploaded)
-                    source_name = uploaded.name
-                    st.success(f"Extracted {len(source_text):,} characters from {uploaded.name}.")
-                except Exception as exc:
-                    st.error(f"Text extraction failed: {exc}")
+            if lookup_mode == "Enter a bill number":
+                c1, c2 = st.columns([0.7, 0.3], gap="large")
+                with c1:
+                    citation_value = st.text_input(
+                        "Federal bill or resolution number",
+                        value=st.session_state.get("live_citation", "H.R. 1"),
+                        placeholder="Examples: H.R. 3076, S. 1, H.J.Res. 7",
+                        key="live_citation_input",
+                    )
+                with c2:
+                    congress_value = st.number_input(
+                        "Congress",
+                        min_value=1,
+                        max_value=200,
+                        value=current_congress,
+                        step=1,
+                        key="live_congress_input",
+                    )
+                if st.button("FETCH FULL TEXT + OFFICIAL METADATA", type="primary", use_container_width=True, key="fetch_live_exact"):
+                    try:
+                        ref = parse_bill_citation(citation_value, int(congress_value))
+                        st.session_state["live_citation"] = ref.citation
+                        load_live_bill(api_key, ref)
+                        st.success(f"Loaded {ref.display} from official sources.")
+                    except Exception as exc:
+                        st.error(f"Live bill retrieval failed: {exc}")
+            else:
+                c1, c2 = st.columns(2)
+                with c1:
+                    browse_congress = st.number_input(
+                        "Congress",
+                        min_value=1,
+                        max_value=200,
+                        value=current_congress,
+                        step=1,
+                        key="browse_congress",
+                    )
+                with c2:
+                    browse_type = st.selectbox(
+                        "Measure type",
+                        list(BILL_TYPE_DISPLAY),
+                        format_func=lambda key: BILL_TYPE_DISPLAY[key],
+                        key="browse_type",
+                    )
+                if st.button("LOAD RECENT OFFICIAL RECORDS", use_container_width=True, key="browse_load"):
+                    try:
+                        with st.spinner("Loading recent bill records…"):
+                            st.session_state["recent_bills"] = cached_recent_bills(
+                                api_key, int(browse_congress), browse_type, 60
+                            )
+                    except Exception as exc:
+                        st.error(f"Recent-bill lookup failed: {exc}")
+                recent = st.session_state.get("recent_bills")
+                if isinstance(recent, list) and recent:
+                    labels: list[str] = []
+                    refs: list[BillRef] = []
+                    for item in recent:
+                        try:
+                            item_type = str(item.get("type") or browse_type).lower().replace(".", "")
+                            item_type = {"house bill": "hr", "senate bill": "s"}.get(item_type, item_type)
+                            ref = BillRef(int(item.get("congress") or browse_congress), item_type, int(item.get("number")))
+                        except Exception:
+                            continue
+                        refs.append(ref)
+                        labels.append(f"{ref.citation} — {item.get('title') or 'Title unavailable'}")
+                    if refs:
+                        selected = st.selectbox("Select a live bill", range(len(refs)), format_func=lambda i: labels[i])
+                        if st.button("FETCH SELECTED BILL", type="primary", use_container_width=True, key="fetch_live_selected"):
+                            try:
+                                load_live_bill(api_key, refs[selected])
+                                st.success(f"Loaded {refs[selected].display} from official sources.")
+                            except Exception as exc:
+                                st.error(f"Live bill retrieval failed: {exc}")
 
-        elif input_mode == "Paste text":
-            source_text = st.text_area(
-                "Paste redacted notice text",
-                height=235,
-                placeholder="Paste the court notice or citation text here…",
-            ).strip()
-            source_name = "pasted_text"
+        live_doc = current_document()
+        if live_doc and live_doc.get("source_kind") == "official Congress.gov text":
+            candidate_document = live_doc
+            bundle = live_doc.get("bundle", {})
+            versions = [item for item in bundle.get("text_versions", []) if isinstance(item, Mapping)]
+            st.markdown("### Loaded official source")
+            st.write(f"**{live_doc.get('citation')} — {live_doc.get('title')}**")
+            st.caption(f"Text source: {live_doc.get('source_url')}")
+            if versions and api_key:
+                selected_version_index = st.selectbox(
+                    "Choose another official text version",
+                    range(len(versions)),
+                    format_func=lambda i: version_label(versions[i], i),
+                    key="load_version_index",
+                )
+                if st.button("LOAD SELECTED VERSION FOR ANALYSIS", use_container_width=True, key="load_alt_version"):
+                    try:
+                        downloaded = official_text_for_version(api_key, versions[selected_version_index])
+                        store_document(
+                            text=downloaded["text"],
+                            title=str(live_doc.get("title") or ""),
+                            citation=str(live_doc.get("citation") or ""),
+                            source_kind="official Congress.gov text",
+                            bundle=bundle,
+                            source_url=downloaded.get("source_url", ""),
+                            source_name=str(live_doc.get("source_name") or ""),
+                            selected_version=versions[selected_version_index],
+                        )
+                        st.success("The selected official version is now the analysis source.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not load the selected text version: {exc}")
 
-        else:
-            source_text = DEMO_BILL_TEXT
-            source_name = "demo_speeding_notice.txt"
-            st.code(DEMO_BILL_TEXT, language="text")
+    elif input_mode == "Paste bill text":
+        c1, c2 = st.columns([0.35, 0.65], gap="large")
+        with c1:
+            manual_citation = st.text_input("Bill citation / label", value="Manual bill text", key="paste_citation")
+            manual_title = st.text_input("Bill title", value="", key="paste_title")
+            manual_url = st.text_input(
+                "Official source URL (recommended)",
+                value="",
+                placeholder="Paste the Congress.gov bill page URL",
+                key="paste_url",
+            )
+        with c2:
+            manual_text = st.text_area(
+                "Paste legislative text",
+                height=330,
+                placeholder="Paste the full bill text or a substantial section here…",
+                key="paste_text",
+            )
+        if manual_text.strip():
+            candidate_document = {
+                "text": manual_text.strip(),
+                "title": manual_title.strip() or "Untitled pasted legislative text",
+                "citation": manual_citation.strip() or "Manual text",
+                "source_kind": "pasted text",
+                "bundle": {},
+                "source_url": manual_url.strip(),
+                "source_name": "pasted_text",
+                "selected_version": {},
+            }
 
-    with right:
-        st.markdown(
-            """
-<div class="bb-aside">
-  <div class="bb-aside-title">Privacy before prediction</div>
-  <p>Redact names, addresses, dates of birth, account numbers, barcodes, license numbers, and other identifying information before upload.</p>
-</div>
-<div class="bb-aside" style="margin-top:2rem;">
-  <div class="bb-aside-title">Model scope</div>
-  <p>The included model uses fictional <strong>Demo-*</strong> jurisdiction labels and synthetic outcomes. Treat every output as a prototype estimate.</p>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
+    elif input_mode == "Upload bill PDF":
+        upload = st.file_uploader("Upload a searchable/text PDF", type=["pdf"], key="bill_pdf")
+        c1, c2, c3 = st.columns(3)
+        upload_citation = c1.text_input("Bill citation / label", value="Uploaded bill", key="upload_citation")
+        upload_title = c2.text_input("Bill title", value="", key="upload_title")
+        upload_url = c3.text_input("Official source URL (recommended)", value="", key="upload_url")
+        if upload is not None:
+            try:
+                with st.spinner("Extracting text from the PDF…"):
+                    pdf_text = extract_pdf_text(upload.getvalue())
+                st.success(f"Extracted {len(pdf_text):,} characters from {upload.name}.")
+                candidate_document = {
+                    "text": pdf_text,
+                    "title": upload_title.strip() or Path(upload.name).stem,
+                    "citation": upload_citation.strip() or "Uploaded bill",
+                    "source_kind": "uploaded PDF",
+                    "bundle": {},
+                    "source_url": upload_url.strip(),
+                    "source_name": upload.name,
+                    "selected_version": {},
+                }
+                with st.expander("PREVIEW EXTRACTED PDF TEXT", expanded=False):
+                    st.text_area("Extracted text", pdf_text, height=280, disabled=True)
+            except Exception as exc:
+                st.error(f"PDF extraction failed: {exc}")
 
-    if source_text:
-        parsed = parse_bill_text(
-            source_text,
-            defaults={"prior_case_count": 0, "jurisdiction": "Demo-MD"},
-        )
+    else:
+        demo_text = DEMO_PATH.read_text(encoding="utf-8")
+        candidate_document = {
+            "text": demo_text,
+            "title": "Digital Skills and Rural Clinic Support Act of 2026 (fictional demonstration)",
+            "citation": "H.R. DEMO",
+            "source_kind": "fictional demonstration",
+            "bundle": demo_bundle(),
+            "source_url": "",
+            "source_name": DEMO_PATH.name,
+            "selected_version": {},
+        }
+        st.info("This fictional measure is included only to demonstrate every analysis panel without an API key.")
+        with st.expander("VIEW FICTIONAL DEMO BILL", expanded=False):
+            st.code(demo_text, language="text")
 
-        with st.expander("REVIEW EXTRACTED TEXT", expanded=False):
-            st.text_area("Extracted text", source_text, height=225, disabled=True)
-
+    if candidate_document:
         st.markdown('<div class="bb-rule"></div>', unsafe_allow_html=True)
         section_intro(
-            "analysis workbench / step 02",
-            "Check the machine-read facts.",
-            "OCR and rule-based extraction can be wrong. Confirm each field against the original notice before you run the model.",
+            "input + ingestion / step 02",
+            "Run the neutral analysis pipeline.",
+            "The pipeline separates source retrieval from AI paraphrase, reports uncertainty, and keeps official verification links visible whenever available.",
         )
+        preview_cols = st.columns(3)
+        preview_cols[0].metric("Source", str(candidate_document.get("source_kind", "")))
+        preview_cols[1].metric("Words", f"{len(str(candidate_document.get('text', '')).split()):,}")
+        preview_cols[2].metric("Official URL", "Provided" if candidate_document.get("source_url") or candidate_document.get("bundle", {}).get("ref", {}).get("official_url") else "Missing")
+        if st.button("RUN AI BILL ANALYSIS →", type="primary", use_container_width=True, key="run_analysis"):
+            try:
+                with st.spinner("Mapping sections, status, fiscal signals, terminology, and uncertainty…"):
+                    analysis = analyze_bill(
+                        str(candidate_document["text"]),
+                        bundle=candidate_document.get("bundle", {}),
+                        source_kind=str(candidate_document.get("source_kind") or "pasted text"),
+                        text_source_url=str(candidate_document.get("source_url") or ""),
+                        citation=str(candidate_document.get("citation") or "Manual text"),
+                        title=str(candidate_document.get("title") or ""),
+                    )
+                    source_link_override(analysis, str(candidate_document.get("source_url") or ""))
+                    st.session_state["working_document"] = candidate_document
+                    st.session_state["analysis"] = analysis
+                    st.session_state.pop("personalization", None)
+                    st.session_state.pop("version_diff", None)
+                    st.session_state.pop("compare_analysis", None)
+                st.success("Analysis complete. Review the official source links and section text alongside the paraphrase.")
+            except Exception as exc:
+                st.error(f"Analysis failed: {exc}")
 
-        c1, c2, c3 = st.columns(3, gap="large")
+    analysis = current_analysis()
+    document = current_document()
+    if analysis and document:
+        render_analysis_results(analysis, document)
+
+
+# -----------------------------------------------------------------------------
+# Personalization tab
+# -----------------------------------------------------------------------------
+with personal_tab:
+    section_intro(
+        "profile-based relevance",
+        "How this may affect someone with your profile.",
+        "The tool checks age, state, income bracket, occupation, and optional status fields against bill language. It identifies what to verify; it does not determine legal eligibility or a guaranteed financial result.",
+    )
+    analysis = current_analysis()
+    if not analysis:
+        st.info("Analyze a bill first. The profile checklist will then connect your information to specific provisions and topics.")
+    else:
+        user = st.session_state.get("user")
+        saved = get_profile(int(user["id"])) if isinstance(user, Mapping) and "id" in user else {}
+        c1, c2, c3 = st.columns(3)
         with c1:
-            parsed_jurisdiction = parsed.get("jurisdiction", "Demo-MD")
-            if parsed_jurisdiction not in DEMO_JURISDICTIONS:
-                parsed_jurisdiction = "Demo-MD"
-            jurisdiction = st.selectbox(
-                "Fictional model jurisdiction",
-                DEMO_JURISDICTIONS,
-                index=DEMO_JURISDICTIONS.index(parsed_jurisdiction),
-            )
+            age = st.number_input("Age", min_value=0, max_value=120, value=int(saved.get("age") or 0), step=1, key="profile_age")
+            state = st.text_input("State (two-letter code)", value=str(saved.get("state") or ""), max_chars=2, key="profile_state").upper()
+        with c2:
+            income_options = ["Not provided", "Under $25,000", "$25,000–$49,999", "$50,000–$99,999", "$100,000–$199,999", "$200,000+"]
+            saved_income = str(saved.get("income_bracket") or "Not provided")
+            income = st.selectbox("Household income bracket", income_options, index=income_options.index(saved_income) if saved_income in income_options else 0, key="profile_income")
+            occupation = st.text_input("Occupation", value=str(saved.get("occupation") or ""), key="profile_occupation")
+        with c3:
+            industry = st.text_input("Industry", value=str(saved.get("industry") or ""), key="profile_industry")
+            household = st.selectbox("Household context", ["Not provided", "One adult", "Multiple adults", "Household with children", "Multigenerational household"], index=0, key="profile_household")
+        flags = st.columns(4)
+        student = flags[0].checkbox("Student", value=bool(saved.get("student")), key="profile_student")
+        veteran = flags[1].checkbox("Veteran", value=bool(saved.get("veteran")), key="profile_veteran")
+        business_owner = flags[2].checkbox("Business owner", value=bool(saved.get("business_owner")), key="profile_business")
+        caregiver = flags[3].checkbox("Caregiver", value=bool(saved.get("caregiver")), key="profile_caregiver")
+        profile = {
+            "age": int(age),
+            "state": state,
+            "income_bracket": income,
+            "occupation": occupation,
+            "industry": industry,
+            "household": household,
+            "student": student,
+            "veteran": veteran,
+            "business_owner": business_owner,
+            "caregiver": caregiver,
+        }
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("GENERATE PERSONAL IMPACT CHECKLIST", type="primary", use_container_width=True, key="run_personal"):
+                st.session_state["personalization"] = personalize_impact(analysis, profile)
+        with c2:
+            if user and st.button("SAVE PROFILE TO MY ACCOUNT", use_container_width=True, key="save_profile"):
+                try:
+                    save_profile(int(user["id"]), profile)
+                    st.success("Profile saved to the prototype account database.")
+                except Exception as exc:
+                    st.error(f"Profile save failed: {exc}")
+            elif not user:
+                st.caption("Create or sign in to an account to save this profile. You can still run the checklist without logging in.")
+        result = st.session_state.get("personalization")
+        if isinstance(result, Mapping):
+            callout(str(result.get("overall", "")), str(result.get("disclaimer", "")), "profile relevance")
+            signals = result.get("signals", [])
+            if signals:
+                st.dataframe(pd.DataFrame(signals), use_container_width=True, hide_index=True)
 
-            parsed_violation = parsed.get("violation_code", VIOLATION_CODES[0])
-            if parsed_violation not in VIOLATION_CODES:
-                parsed_violation = VIOLATION_CODES[0]
-            violation = st.selectbox(
-                "Violation code",
-                VIOLATION_CODES,
-                index=VIOLATION_CODES.index(parsed_violation),
-            )
-            case_type = CASE_TYPE_MAP[violation]
+
+# -----------------------------------------------------------------------------
+# Follow and civic action tab
+# -----------------------------------------------------------------------------
+with civic_tab:
+    section_intro(
+        "engagement + verification",
+        "Follow the record, find representatives, and write in your own voice.",
+        "The app supplies official directories and a neutral editable draft. It does not choose a position, send messages automatically, or make electoral recommendations.",
+    )
+    analysis = current_analysis()
+    document = current_document()
+    if not analysis or not document:
+        st.info("Analyze a live or uploaded bill first.")
+    else:
+        bundle = document.get("bundle", {})
+        live_ref = bundle.get("ref") if isinstance(bundle.get("ref"), Mapping) else {}
+        user = st.session_state.get("user")
+        c1, c2 = st.columns([0.58, 0.42], gap="large")
+        with c1:
+            st.markdown("### Sponsor, cosponsors, and vote record")
+            sponsors = sponsor_rows(bundle)
+            if sponsors:
+                st.dataframe(pd.DataFrame(sponsors), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No sponsor/cosponsor metadata was supplied for this source.")
+            votes = extract_votes(bundle)
+            if votes:
+                st.dataframe(pd.DataFrame(votes), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No recorded-vote links were returned in the action metadata.")
+
+            if live_ref.get("bill_id") and user:
+                action_date, action_text = action_snapshot(bundle)
+                if st.button("FOLLOW THIS BILL", type="primary", use_container_width=True, key="follow_current"):
+                    try:
+                        follow_bill(
+                            int(user["id"]),
+                            bill_id=str(live_ref["bill_id"]),
+                            citation=analysis.citation,
+                            title=analysis.title,
+                            official_url=str(live_ref.get("official_url") or ""),
+                            status=analysis.status.label,
+                            latest_action_date=action_date,
+                            latest_action_text=action_text,
+                        )
+                        st.success("Bill saved. Use Account → Followed bills to check for live changes.")
+                    except Exception as exc:
+                        st.error(f"Could not follow the bill: {exc}")
+            elif not user:
+                st.info("Sign in under Account to save/follow bills and receive in-app change notifications.")
+            elif not live_ref.get("bill_id"):
+                st.caption("Follow/status-change checks require a live Congress.gov bill identifier.")
 
         with c2:
-            fine_amount = st.number_input(
-                "Listed fine ($)",
-                min_value=0.0,
-                max_value=100000.0,
-                value=float(parsed["fine_amount"]),
-                step=5.0,
-            )
-            days_to_due = st.number_input(
-                "Response window (days)",
-                min_value=1,
-                max_value=365,
-                value=int(parsed["days_to_due"]),
-                step=1,
-            )
-            prior_cases = st.number_input(
-                "Prior similar case count",
-                min_value=0,
-                max_value=20,
-                value=int(parsed["prior_case_count"]),
-                step=1,
-            )
-
-        with c3:
-            speed_over = st.number_input(
-                "Speed above limit (mph)",
-                min_value=0,
-                max_value=100,
-                value=int(parsed["speed_over_mph"]),
-                step=1,
-            )
-            court_required = st.checkbox(
-                "Court appearance marked required",
-                value=bool(parsed["court_appearance_required"]),
-            )
-            st.text_input("Case type", value=case_type, disabled=True)
-
-        case = {
-            "bill_text": source_text,
-            "jurisdiction": jurisdiction,
-            "case_type": case_type,
-            "violation_code": violation,
-            "fine_amount": float(fine_amount),
-            "days_to_due": int(days_to_due),
-            "prior_case_count": int(prior_cases),
-            "speed_over_mph": int(speed_over),
-            "court_appearance_required": int(court_required),
-        }
-
-        if st.button("RUN AI IMPACT ANALYSIS →", type="primary", use_container_width=True):
-            if len(source_text.strip()) < 10:
-                st.error("The extracted text is too short to analyze reliably.")
-            else:
-                try:
-                    bundle, dnn_state = get_models()
-                    pred = predict_case(bundle, dnn_state, case)
-                    report = make_impact_report(case, pred)
-                    result_json = json.dumps(
-                        {
-                            "source_name": source_name,
-                            "parsed_case": case,
-                            "prediction": asdict(pred),
-                        },
-                        indent=2,
-                    )
-                    st.session_state["analysis_result"] = (
-                        case,
-                        pred,
-                        report,
-                        result_json,
-                    )
-                except Exception as exc:
-                    st.exception(exc)
-
-    if "analysis_result" in st.session_state:
-        case, pred, report, result_json = st.session_state["analysis_result"]
+            st.markdown("### Find your federal representatives")
+            rep_state = st.text_input("State code", value=str((get_profile(int(user["id"])) if user else {}).get("state") or ""), max_chars=2, key="rep_state").upper()
+            rep_district = st.number_input("House district (optional; 0 = statewide lookup)", min_value=0, max_value=99, value=0, step=1, key="rep_district")
+            api_key = active_api_key()
+            if st.button("LOOK UP CURRENT MEMBERS", use_container_width=True, key="lookup_members"):
+                if not api_key:
+                    st.error("Add a Congress.gov API key in the Analyze tab first.")
+                elif len(rep_state) != 2:
+                    st.error("Enter a two-letter state code.")
+                else:
+                    try:
+                        with st.spinner("Retrieving current member records…"):
+                            members = cached_members(api_key, rep_state, int(rep_district) if rep_district else None)
+                        st.session_state["member_results"] = members
+                    except Exception as exc:
+                        st.error(f"Member lookup failed: {exc}")
+            members = st.session_state.get("member_results")
+            if isinstance(members, list) and members:
+                st.dataframe(pd.DataFrame([member_display(item) for item in members]), use_container_width=True, hide_index=True)
+            link_cols = st.columns(2)
+            link_cols[0].link_button("HOUSE DIRECTORY ↗", HOUSE_CONTACT_URL, use_container_width=True)
+            link_cols[1].link_button("SENATE DIRECTORY ↗", SENATE_CONTACT_URL, use_container_width=True)
 
         st.markdown('<div class="bb-rule"></div>', unsafe_allow_html=True)
-        section_intro(
-            "AI breakdown / step 03",
-            "The plain-English read.",
-            "The figures below are ensemble estimates from synthetic training records. The calibration ranges show model uncertainty, not guaranteed legal or financial outcomes.",
+        st.markdown("### Build an editable constituent message")
+        position = st.selectbox(
+            "Choose your own purpose",
+            ["Request information", "Express support", "Express opposition", "Share a concern"],
+            key="contact_position",
         )
+        c1, c2 = st.columns(2)
+        sender_name = c1.text_input("Your name (optional)", value=str(user.get("display_name") if isinstance(user, Mapping) else ""), key="contact_name")
+        sender_state = c2.text_input("Your state (optional)", value=rep_state, max_chars=2, key="contact_state")
+        custom_note = st.text_area(
+            "Your own question, reason, or concern",
+            placeholder="Describe the provision you care about in your own words…",
+            key="contact_note",
+        )
+        message = build_contact_message(
+            analysis,
+            position=position,
+            sender_name=sender_name,
+            state=sender_state,
+            custom_note=custom_note,
+        )
+        edited_message = st.text_area("Editable draft", value=message, height=330, key="contact_draft")
+        st.download_button(
+            "DOWNLOAD CONTACT DRAFT",
+            data=edited_message,
+            file_name=f"contact_representative_{re.sub(r'[^A-Za-z0-9]+', '_', analysis.citation)}.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+        st.caption("The app does not send the message. Review the latest official bill version, edit the draft, and use the official House or Senate directory.")
 
-        risk_color = {
-            "low": "#3a7a4a",
-            "medium": "#d07a2d",
-            "high": "#a04438",
-        }.get(pred.risk_level, "#d07a2d")
-        st.markdown(
-            f"""
-<div class="bb-impact" style="border-color:{risk_color};">
-  <div class="bb-impact-label" style="color:{risk_color} !important;">personal impact / synthetic {html.escape(pred.risk_level)} profile</div>
-  <div class="bb-impact-headline">{html.escape(impact_headline(pred.risk_level))}</div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
 
-        render_metrics(pred)
-        st.progress(
-            min(max(float(pred.escalation_probability), 0.0), 1.0),
-            text="Modeled nonpayment / escalation probability",
-        )
-        st.markdown(
-            f"""
-<div class="bb-range-strip">
-  Approximate 90% calibration ranges — insurance: <strong>{pred.insurance_low_pct:.1f}%–{pred.insurance_high_pct:.1f}%</strong>;
-  duration: <strong>{pred.duration_low_years:.1f}–{pred.duration_high_years:.1f} years</strong>;
-  points: <strong>{pred.license_points_low:.1f}–{pred.license_points_high:.1f}</strong>.
-</div>
-""",
-            unsafe_allow_html=True,
-        )
+# -----------------------------------------------------------------------------
+# Comparison tab
+# -----------------------------------------------------------------------------
+with compare_tab:
+    section_intro(
+        "side-by-side comparison",
+        "Compare a House bill, Senate bill, or competing text.",
+        "The comparison reports text similarity, shared topics, status, section counts, and budget signals without declaring a winner or predicting passage.",
+    )
+    left_analysis = current_analysis()
+    if not left_analysis:
+        st.info("Analyze the first bill in the Analyze tab. It will become the left side of the comparison.")
+    else:
+        st.markdown(f"**Left bill:** {left_analysis.citation} — {left_analysis.title}")
+        compare_mode = st.radio("Second bill source", ["Live Congress.gov bill", "Paste text"], horizontal=True, key="compare_mode")
+        if compare_mode == "Live Congress.gov bill":
+            api_key = active_api_key()
+            if not api_key:
+                st.info("Add a Congress.gov API key in the Analyze tab before loading a live comparison bill.")
+            compare_citation = st.text_input("Second bill citation", value="S. 1", key="compare_citation")
+            compare_congress = st.number_input("Second bill Congress", min_value=1, max_value=200, value=current_congress_fallback(), step=1, key="compare_congress")
+            if st.button("LOAD + ANALYZE SECOND LIVE BILL", type="primary", use_container_width=True, key="compare_live_run"):
+                if not api_key:
+                    st.error("A Congress.gov API key is required.")
+                else:
+                    try:
+                        ref = parse_bill_citation(compare_citation, int(compare_congress))
+                        with st.spinner("Retrieving and analyzing the second official bill…"):
+                            bundle = cached_bill_bundle(api_key, ref.congress, ref.bill_type, ref.number)
+                            version = latest_text_version([v for v in bundle.get("text_versions", []) if isinstance(v, dict)])
+                            if not version:
+                                raise CongressAPIError("No downloadable official text version was returned for the second bill.")
+                            downloaded = official_text_for_version(api_key, version)
+                            detail = bundle.get("detail") if isinstance(bundle.get("detail"), Mapping) else {}
+                            right_analysis = analyze_bill(
+                                downloaded["text"],
+                                bundle=bundle,
+                                source_kind="official Congress.gov text",
+                                text_source_url=downloaded.get("source_url", ""),
+                                citation=ref.citation,
+                                title=str(detail.get("title") or ref.display),
+                            )
+                        st.session_state["compare_analysis"] = right_analysis
+                    except Exception as exc:
+                        st.error(f"Second-bill analysis failed: {exc}")
+        else:
+            c1, c2 = st.columns(2)
+            compare_label = c1.text_input("Second bill citation / label", value="Comparison text", key="compare_label")
+            compare_title = c2.text_input("Second bill title", value="", key="compare_title")
+            compare_text = st.text_area("Paste second bill text", height=280, key="compare_text")
+            if st.button("ANALYZE SECOND PASTED BILL", type="primary", use_container_width=True, key="compare_paste_run"):
+                try:
+                    st.session_state["compare_analysis"] = analyze_bill(
+                        compare_text,
+                        source_kind="pasted comparison text",
+                        citation=compare_label,
+                        title=compare_title or "Pasted comparison text",
+                    )
+                except Exception as exc:
+                    st.error(f"Second-bill analysis failed: {exc}")
 
-        report_view, inputs_view, download_view = st.tabs(
-            ["IMPACT REPORT", "PARSED INPUTS", "DOWNLOADS"]
-        )
-        with report_view:
-            st.markdown(report)
-        with inputs_view:
-            st.dataframe(
-                pd.DataFrame([case]).T.rename(columns={0: "value"}),
-                use_container_width=True,
+        right_analysis = st.session_state.get("compare_analysis")
+        if isinstance(right_analysis, BillAnalysis):
+            comparison = compare_analyses(left_analysis, right_analysis)
+            metric_cards(
+                [
+                    ("Text similarity", f"{comparison['similarity_pct']:.1f}%", "TF-IDF overlap, not legal equivalence"),
+                    ("Left stage", comparison["status"]["left"].title(), f"{comparison['sections']['left']} mapped sections"),
+                    ("Right stage", comparison["status"]["right"].title(), f"{comparison['sections']['right']} mapped sections"),
+                ]
             )
-        with download_view:
-            d1, d2 = st.columns(2, gap="large")
-            d1.download_button(
-                "DOWNLOAD MARKDOWN REPORT",
-                data=report.encode("utf-8"),
-                file_name="claire_yuan_court_bill_impact_report.md",
-                mime="text/markdown",
-                use_container_width=True,
-            )
-            d2.download_button(
-                "DOWNLOAD STRUCTURED JSON",
-                data=result_json.encode("utf-8"),
-                file_name="claire_yuan_court_bill_impact_result.json",
-                mime="application/json",
-                use_container_width=True,
+            st.info(comparison["note"])
+            c1, c2 = st.columns(2, gap="large")
+            with c1:
+                st.markdown(f"### {left_analysis.citation}: {left_analysis.title}")
+                st.write(left_analysis.plain_summary)
+                st.write("**Topics:** " + (", ".join(left_analysis.topics) or "None detected"))
+            with c2:
+                st.markdown(f"### {right_analysis.citation}: {right_analysis.title}")
+                st.write(right_analysis.plain_summary)
+                st.write("**Topics:** " + (", ".join(right_analysis.topics) or "None detected"))
+            st.markdown("### Topic overlap")
+            st.json(
+                {
+                    "shared_topics": comparison["shared_topics"],
+                    "left_only_topics": comparison["left_only_topics"],
+                    "right_only_topics": comparison["right_only_topics"],
+                    "fiscal_signals": comparison["fiscal"],
+                }
             )
 
+
+# -----------------------------------------------------------------------------
+# Account tab
+# -----------------------------------------------------------------------------
+with account_tab:
+    section_intro(
+        "prototype account layer",
+        "Save a profile, follow bills, and view in-app changes.",
+        "This demo uses a local SQLite database and salted password hashes. On Streamlit Community Cloud, local storage may reset during redeploys, restarts, or platform maintenance; production use requires a managed identity and database service.",
+    )
+    user = st.session_state.get("user")
+    if not user:
+        login_tab, register_tab = st.tabs(["SIGN IN", "CREATE ACCOUNT"])
+        with login_tab:
+            with st.form("login_form"):
+                login_email = st.text_input("Email")
+                login_password = st.text_input("Password", type="password")
+                login_submit = st.form_submit_button("SIGN IN", use_container_width=True)
+            if login_submit:
+                try:
+                    authenticated = authenticate(login_email, login_password)
+                    if authenticated:
+                        st.session_state["user"] = authenticated
+                        st.success("Signed in.")
+                        st.rerun()
+                    else:
+                        st.error("Email or password was not recognized.")
+                except Exception as exc:
+                    st.error(f"Sign-in failed: {exc}")
+        with register_tab:
+            with st.form("register_form"):
+                register_name = st.text_input("Display name")
+                register_email = st.text_input("Email", key="register_email")
+                register_password = st.text_input("Password (8+ characters)", type="password", key="register_password")
+                register_submit = st.form_submit_button("CREATE PROTOTYPE ACCOUNT", use_container_width=True)
+            if register_submit:
+                try:
+                    created = create_user(register_email, register_password, register_name)
+                    st.session_state["user"] = created
+                    st.success("Account created and signed in.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Account creation failed: {exc}")
+    else:
+        c1, c2 = st.columns([0.75, 0.25])
+        c1.write(f"Signed in as **{user.get('display_name') or user.get('email')}**")
+        if c2.button("SIGN OUT", use_container_width=True):
+            st.session_state.pop("user", None)
+            st.session_state.pop("personalization", None)
+            st.rerun()
+
+        follows = list_follows(int(user["id"]))
+        notifications = list_notifications(int(user["id"]))
+        metric_cards(
+            [
+                ("Followed bills", str(len(follows)), "saved in this prototype database"),
+                ("Unread notifications", str(sum(1 for item in notifications if not item.get("is_read"))), "created during manual status checks"),
+                ("Registered profile", "Saved" if get_profile(int(user["id"])) else "Empty", "edit under How This Affects You"),
+            ]
+        )
+        st.markdown("### Followed bills")
+        if follows:
+            st.dataframe(pd.DataFrame(follows), use_container_width=True, hide_index=True)
+            api_key = active_api_key()
+            if st.button("CHECK FOLLOWED BILLS FOR STATUS CHANGES", type="primary", use_container_width=True, key="check_follows"):
+                if not api_key:
+                    st.error("Add a Congress.gov API key in the Analyze tab first.")
+                else:
+                    changed = 0
+                    failures: list[str] = []
+                    progress = st.progress(0)
+                    for index, item in enumerate(follows):
+                        try:
+                            match = re.fullmatch(r"(\d+)-([a-z]+)-(\d+)", str(item.get("bill_id") or ""))
+                            if not match:
+                                continue
+                            ref = BillRef(int(match.group(1)), match.group(2), int(match.group(3)))
+                            bundle = cached_bill_bundle(api_key, ref.congress, ref.bill_type, ref.number)
+                            status = analyze_bill(
+                                "This placeholder text supports status refresh only. " * 5,
+                                bundle=bundle,
+                                source_kind="official metadata refresh",
+                                citation=ref.citation,
+                                title=str((bundle.get("detail") or {}).get("title") or ref.display),
+                            ).status
+                            action_date, action_text = action_snapshot(bundle)
+                            if update_follow_and_notify(
+                                int(user["id"]),
+                                str(item["bill_id"]),
+                                new_status=status.label,
+                                latest_action_date=action_date,
+                                latest_action_text=action_text,
+                            ):
+                                changed += 1
+                        except Exception as exc:
+                            failures.append(f"{item.get('citation')}: {exc}")
+                        progress.progress((index + 1) / max(len(follows), 1))
+                    if changed:
+                        st.success(f"Detected changes for {changed} followed bill(s).")
+                    else:
+                        st.info("No changes were detected in the retrieved official records.")
+                    if failures:
+                        st.warning("Some checks failed: " + " | ".join(failures[:5]))
+                    st.rerun()
+            selected_unfollow = st.selectbox(
+                "Remove a followed bill",
+                options=[item["bill_id"] for item in follows],
+                format_func=lambda bill_id: next((f"{item['citation']} — {item['title']}" for item in follows if item["bill_id"] == bill_id), bill_id),
+                key="unfollow_select",
+            )
+            if st.button("UNFOLLOW SELECTED BILL", use_container_width=True, key="unfollow_button"):
+                unfollow_bill(int(user["id"]), selected_unfollow)
+                st.success("Bill removed from followed list.")
+                st.rerun()
+        else:
+            st.caption("No followed bills yet. Analyze a live bill, then use Follow + Contact.")
+
+        st.markdown("### In-app notifications")
+        notifications = list_notifications(int(user["id"]))
+        if notifications:
+            st.dataframe(pd.DataFrame(notifications), use_container_width=True, hide_index=True)
+            if st.button("MARK ALL NOTIFICATIONS READ", use_container_width=True, key="mark_notifications"):
+                mark_notifications_read(int(user["id"]))
+                st.rerun()
+        else:
+            st.caption("No notifications. This prototype creates notifications only when you manually check followed bills.")
+
+
+# -----------------------------------------------------------------------------
+# Methodology tab
+# -----------------------------------------------------------------------------
 with methodology_tab:
     section_intro(
-        "prototype architecture",
-        "From document to calibrated report.",
-        "The pipeline preserves the notebook's ML logic while the cloud app uses lightweight NumPy inference for the PyTorch-trained neural network.",
+        "transparent methodology",
+        "What the AI does — and what it does not do.",
+        "The default cloud build uses explainable local NLP and official public data. It avoids a heavyweight model dependency so Streamlit Community Cloud can start quickly and users can inspect the logic.",
     )
-
     st.markdown(
         """
-<div class="bb-step-grid">
-  <div class="bb-step"><div class="bb-step-no">step 01</div><h3>Ingest</h3><p>Accept PDF, image, TXT, CSV, or Markdown. OCR is used only when normal text extraction is insufficient.</p></div>
-  <div class="bb-step"><div class="bb-step-no">step 02</div><h3>Parse</h3><p>Transparent regular expressions and keyword rules extract amount, deadline, violation, speed, and court-appearance signals.</p></div>
-  <div class="bb-step"><div class="bb-step-no">step 03</div><h3>Represent</h3><p>TF-IDF text features are combined with one-hot categorical variables and standardized numeric features.</p></div>
-  <div class="bb-step"><div class="bb-step-no">step 04</div><h3>Predict</h3><p>Classical Ridge/logistic models and a multi-task DNN estimate continuous and categorical prototype outcomes.</p></div>
-  <div class="bb-step"><div class="bb-step-no">step 05</div><h3>Ensemble</h3><p>Classical and neural predictions are blended rather than treating either model family as a sole decision-maker.</p></div>
-  <div class="bb-step"><div class="bb-step-no">step 06</div><h3>Calibrate</h3><p>Held-out synthetic residuals form approximate 90% empirical ranges around the regression estimates.</p></div>
-  <div class="bb-step"><div class="bb-step-no">step 07</div><h3>Present</h3><p>A constrained RL demo selects report presentation style only. It never changes an official legal consequence.</p></div>
-  <div class="bb-step"><div class="bb-step-no">cloud</div><h3>Stay light</h3><p>The DNN is trained in PyTorch offline, then exported to NumPy arrays so Streamlit Cloud does not download PyTorch at startup.</p></div>
-  <div class="bb-step"><div class="bb-step-no">human</div><h3>Verify</h3><p>Every parsed field and predicted consequence requires comparison with the original notice and an authoritative source.</p></div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+### 1. Official retrieval
+Live mode uses the Congress.gov API for bill detail, actions, amendments, committees, cosponsors, related bills, subjects, summaries, text versions, and titles. The selected official text file is downloaded only from allowlisted Congress.gov, GovInfo, or GPO hosts.
 
-    st.markdown('<div class="bb-rule"></div>', unsafe_allow_html=True)
-    st.info(
-        "The bundled training data are synthetic Demo-* records. Replace them only with lawful, de-identified, documented, jurisdiction-approved records before any serious evaluation."
-    )
+### 2. Plain-English AI
+The app splits the bill into sections, tokenizes sentences, builds TF-IDF representations, and ranks central sentences using document relevance plus position. A transparent legalese-replacement layer simplifies selected wording. This is an extractive NLP system: it does not invent missing provisions.
 
-    if MODEL_PATH.exists():
-        bundle, _ = get_models()
-        meta = bundle.get("metadata", {})
-        st.markdown("### Bundled model metadata")
-        st.json(meta)
-        q = bundle.get("report_style_q_table")
-        if isinstance(q, pd.DataFrame):
-            st.markdown("### RL report-style value table")
-            st.dataframe(q.round(3), use_container_width=True)
+### 3. Clause and topic mapping
+Rules identify obligation terms such as *shall*, *must*, *may*, *authorize*, *appropriate*, *amend*, and *repeal*. Topic keywords create section-level subject tags. A low-to-medium-confidence scope mismatch flag appears when a substantial section uses a topic vocabulary outside the bill's main detected subjects.
 
-with about_tab:
-    section_intro(
-        "project + deployment",
-        "A Streamlit-native migration of the attached UI system.",
-        "The attached TanStack/React design was translated into native Streamlit so Community Cloud needs only one Python app process. The visual language is preserved without carrying over unrelated legislation-news or Supabase services.",
-    )
+### 4. Status and timeline
+When official action history is available, rule-based evidence maps the record to stages such as introduced, in committee, reported, passed one chamber, passed both chambers, presented to the President, enacted, vetoed, or failed/rejected. The app never estimates the probability of passage.
 
-    st.markdown(
-        """
-<div class="bb-step-grid">
-  <div class="bb-step"><div class="bb-step-no">author</div><h3>Claire Yuan</h3><p>Student author and product developer for the AI Court-Bill Impact Analyzer prototype.</p></div>
-  <div class="bb-step"><div class="bb-step-no">advisor</div><h3>Dr. Qingyang Xiao</h3><p>Project advisor credited in the application, README, notebook metadata, and model bundle.</p></div>
-  <div class="bb-step"><div class="bb-step-no">license</div><h3>MIT</h3><p>The repository includes the standard MIT License with 2026 copyright attribution to Claire Yuan.</p></div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+### 5. Fiscal and profile signals
+Budget analysis surfaces Congress.gov CBO metadata, appropriations/revenue terms, and textual dollar references; it is not a budget score. Personalization creates a relevance checklist from user-supplied fields; it is not a legal eligibility or financial-impact determination.
 
-    st.markdown('<div class="bb-rule"></div>', unsafe_allow_html=True)
-    st.markdown(
-        """
-### Streamlit Community Cloud
-
-Deploy the repository with **`app.py`** as the entrypoint. The inference environment intentionally excludes PyTorch; `requirements.txt` contains cloud runtime dependencies and `packages.txt` contains Tesseract/Poppler system packages for OCR.
-
-### UI migration boundary
-
-The attached source UI also contains legislation-news, bill-search, external service, and Supabase/server features. Those unrelated services were **not** copied into this court-notice prototype. The design system and interaction language were migrated while the existing AI Court-Bill analysis functionality remained the source of truth.
-
-### Responsible-use boundary
-
-This application is an educational model demonstration. It must not be used to make sentencing, guilt, eligibility, creditworthiness, or other high-impact determinations about a person. Official consequences must be verified with the appropriate court, motor-vehicle agency, insurer, or qualified professional.
+### 6. Trust controls
+Official source links remain visible, every section retains source text, confidence reflects source completeness, and version comparison uses a line-level unified diff. User decisions and civic positions remain the user's own.
 """
     )
+    st.markdown("### Streamlit deployment and privacy")
+    st.write(
+        "Set `CONGRESS_API_KEY` in Streamlit Community Cloud secrets. Manual and demo modes work without it. "
+        "The account/follow layer uses local SQLite for a classroom prototype; Cloud local files may be ephemeral. "
+        "Do not store sensitive personal information in this demo. A production deployment should use managed authentication, "
+        "a persistent database, encryption, access controls, audit logs, and a notification service."
+    )
+    st.markdown("### User counter")
+    st.write(
+        "A visitor is counted once per Streamlit browser session. The counter records only a random session hash and timestamps; "
+        "it does not store an IP address in the application database. Browser refreshes within the same live session increase page-view metadata but not the unique-session count."
+    )
+    try:
+        st.json(visitor_stats())
+    except Exception:
+        st.caption("Visitor statistics are unavailable in this runtime.")
+    st.markdown("### Credits")
+    st.write("**Author:** Claire Yuan  \n**Advisor:** Dr. Qingyang Xiao  \n**License:** MIT")
 
-# Principles section mirrors the editorial principles block in the attached UI.
-st.markdown(
-    """
-<section class="bb-principles">
-  <div class="bb-section-kicker">principles</div>
-  <div class="bb-principle-grid">
-    <div>
-      <h2>Explain first.<br><em>Never decide for you.</em></h2>
-    </div>
-    <div class="bb-principle-list">
-      <div class="bb-principle-item"><span class="bb-arrow">→</span><span>Predictions are synthetic research estimates, not official legal outcomes.</span></div>
-      <div class="bb-principle-item"><span class="bb-arrow">→</span><span>Users review machine-extracted fields before analysis.</span></div>
-      <div class="bb-principle-item"><span class="bb-arrow">→</span><span>Personally identifying information should be removed before upload or model development.</span></div>
-      <div class="bb-principle-item"><span class="bb-arrow">→</span><span>High-impact legal, credit, insurance, and eligibility decisions remain outside this prototype.</span></div>
-    </div>
-  </div>
-</section>
-<div class="bb-footer">
-  <span>© 2026 Claire Yuan</span>
-  <span>AI Court-Bill Impact Analyzer</span>
-  <span>Advisor · Dr. Qingyang Xiao</span>
-  <span>MIT License</span>
-</div>
-""",
-    unsafe_allow_html=True,
-)
+footer()

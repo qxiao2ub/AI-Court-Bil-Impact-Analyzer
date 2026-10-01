@@ -1,55 +1,73 @@
-from pathlib import Path
+from __future__ import annotations
+
+import ast
 import sys
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from src.modeling import (  # noqa: E402
-    DEMO_BILL_TEXT,
-    build_dnn_from_bundle,
-    load_bundle,
-    make_impact_report,
-    parse_bill_text,
-    predict_case,
-)
+from src.bill_analysis import analyze_bill, analysis_to_json, analysis_to_markdown
 
 
-def main():
-    model_path = ROOT / "models" / "claire_yuan_court_bill_impact_models.joblib"
-    assert model_path.exists(), f"Missing model: {model_path}"
 
-    bundle = load_bundle(model_path)
-    assert "dnn_numpy_state" in bundle, "Cloud bundle is missing NumPy DNN weights"
-    assert "dnn_state_dict" not in bundle, "Cloud bundle still contains PyTorch tensors"
+def main() -> None:
+    required = [
+        ROOT / "app.py",
+        ROOT / "requirements.txt",
+        ROOT / "LICENSE",
+        ROOT / "README.md",
+        ROOT / ".streamlit" / "config.toml",
+        ROOT / "src" / "congress_client.py",
+        ROOT / "src" / "bill_analysis.py",
+        ROOT / "src" / "persistence.py",
+        ROOT / "src" / "ui.py",
+        ROOT / "examples" / "demo_bill.txt",
+    ]
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        raise AssertionError(f"Missing required repository files: {missing}")
 
-    state = build_dnn_from_bundle(bundle)
-    case = parse_bill_text(
-        DEMO_BILL_TEXT,
-        defaults={"jurisdiction": "Demo-MD", "prior_case_count": 0},
+    for path in [ROOT / "app.py", *sorted((ROOT / "src").glob("*.py"))]:
+        ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+    app_text = (ROOT / "app.py").read_text(encoding="utf-8")
+    ui_text = (ROOT / "src" / "ui.py").read_text(encoding="utf-8")
+    required_strings = [
+        "Claire Yuan",
+        "Dr. Qingyang Xiao",
+        "CONGRESS_API_KEY",
+        "Live Congress.gov bill",
+        "HOW THIS AFFECTS YOU",
+        "FOLLOW + CONTACT",
+        "COMPARE BILLS",
+        "record_visit",
+    ]
+    for value in required_strings:
+        if value not in app_text and value not in ui_text:
+            raise AssertionError(f"Expected app feature marker not found: {value}")
+    for selector in ("stAppViewBlockContainer", "stMainBlockContainer", "streamlit-toolbar-safe-area"):
+        if selector not in ui_text:
+            raise AssertionError(f"Top-banner safe-area selector missing: {selector}")
+
+    text = (ROOT / "examples" / "demo_bill.txt").read_text(encoding="utf-8")
+    analysis = analyze_bill(
+        text,
+        source_kind="fictional demonstration",
+        citation="H.R. DEMO",
+        title="Digital Skills and Rural Clinic Support Act of 2026",
     )
-    pred = predict_case(bundle, state, case)
-    report = make_impact_report(case, pred)
-
-    assert case["violation_code"] == "SPEED_10_19"
-    assert 0.0 <= pred.escalation_probability <= 1.0
-    assert pred.risk_level in {"low", "medium", "high"}
-    assert pred.insurance_high_pct >= pred.insurance_low_pct >= 0.0
-    assert pred.duration_high_years >= pred.duration_low_years >= 0.0
-    assert pred.license_points_high >= pred.license_points_low >= 0.0
-    assert "Prototype Court-Bill Impact Report" in report
-
-    meta = bundle.get("metadata", {})
-    assert meta.get("author") == "Claire Yuan"
-    assert meta.get("advisor") == "Dr. Qingyang Xiao"
+    if len(analysis.sections) < 8:
+        raise AssertionError("Demo section parsing did not produce the expected section map.")
+    if "$120,000,000" not in analysis.fiscal.get("detected_amounts", []):
+        raise AssertionError("Fiscal amount detection failed.")
+    if not analysis_to_markdown(analysis).startswith("# H.R. DEMO"):
+        raise AssertionError("Markdown report generation failed.")
+    if '"analysis"' not in analysis_to_json(analysis):
+        raise AssertionError("JSON report generation failed.")
 
     print("SMOKE TEST PASSED")
-    print(f"Parsed violation: {case['violation_code']}")
-    print(f"Insurance estimate: {pred.insurance_mid_pct:.3f}%")
-    print(f"Impact duration: {pred.duration_mid_years:.3f} years")
-    print(f"License points: {pred.license_points_mid:.3f}")
-    print(f"Escalation probability: {pred.escalation_probability:.4f}")
-    print(f"Risk category: {pred.risk_level}")
-    print(f"Report style: {pred.report_style}")
 
 
 if __name__ == "__main__":

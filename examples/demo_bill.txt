@@ -1,0 +1,31 @@
+Fictional Demonstration Bill — Not an official congressional measure
+
+H.R. DEMO
+Digital Skills and Rural Clinic Support Act of 2026
+
+A BILL
+To expand digital-skills education and telehealth capacity in rural communities, and for other purposes.
+
+SECTION 1. SHORT TITLE.
+This Act may be cited as the “Digital Skills and Rural Clinic Support Act of 2026”.
+
+SEC. 2. FINDINGS AND PURPOSE.
+Congress finds that many rural communities face shortages of trained technology workers and limited access to health services. The purpose of this Act is to establish grants for digital-skills programs, improve telehealth infrastructure, and require public reporting on program outcomes.
+
+SEC. 3. RURAL DIGITAL SKILLS GRANT PROGRAM.
+The Secretary of Education shall establish a competitive grant program for community colleges, public libraries, and nonprofit training providers serving rural counties. An eligible recipient shall use funds for cybersecurity, data literacy, artificial intelligence, and broadband-support training. Priority shall be given to programs serving low-income students, veterans, and displaced workers. The Secretary shall issue regulations not later than 180 days after the date of enactment.
+
+SEC. 4. TELEHEALTH EQUIPMENT AND CONNECTIVITY.
+The Secretary of Health and Human Services shall award grants to rural clinics for secure telehealth equipment, broadband connectivity, and staff training. A covered clinic must submit an annual report describing patient access, service interruptions, and privacy safeguards. Nothing in this section preempts a State law that provides greater patient privacy protection.
+
+SEC. 5. AUTHORIZATION OF APPROPRIATIONS.
+There is authorized to be appropriated $120,000,000 for each of fiscal years 2027 through 2031 to carry out sections 3 and 4. Of the amounts made available, not less than 15 percent shall support cybersecurity controls and independent program evaluation.
+
+SEC. 6. ELECTRIC SCHOOL BUS DEMONSTRATION.
+The Secretary of Transportation may establish a pilot program to provide up to $35,000,000 in grants for electric school buses in communities with populations under 50,000. Grant recipients shall report vehicle uptime and charging costs. This section shall take effect 90 days after the date of enactment.
+
+SEC. 7. REPORTS AND SUNSET.
+Not later than 2 years after the date of enactment, the Comptroller General shall submit a report to Congress on grant performance, geographic distribution, and administrative costs. The authorities under sections 3 and 4 shall terminate on September 30, 2032, unless reauthorized by Congress.
+
+SEC. 8. EFFECTIVE DATE.
+Except as otherwise provided, this Act shall take effect on the date of enactment.
